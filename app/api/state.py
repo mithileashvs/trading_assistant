@@ -1,0 +1,76 @@
+"""
+Shared application state for the FastAPI dashboard (section 33).
+
+Built once at startup and reused across requests — recreating the MT5
+connection, journal, etc. per-request would be wasteful and would also
+break the kill switch / position-monitor state that needs to persist
+across calls.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from app.ai.llm_client import build_llm_client
+from app.config.settings import Settings, get_settings
+from app.execution.engine import ExecutionEngine
+from app.journal.journal import TradeJournal
+from app.market_data.engine import MarketDataEngine
+from app.mt5.factory import build_mt5_client
+from app.mt5.interface import IMT5Client, SymbolSpec
+from app.news.calendar import build_news_filter
+from app.positions.monitor import PositionMonitor
+from app.regimes.thresholds import RegimeThresholds
+from app.risk.guards import RiskGuardEngine
+from app.risk.kill_switch import KillSwitch
+from app.risk.validator import TradeValidator
+from app.strategies.selector import StrategySelector
+
+
+@dataclass
+class AppState:
+    settings: Settings
+    client: IMT5Client
+    symbol_spec: SymbolSpec
+    market_data: MarketDataEngine
+    selector: StrategySelector
+    validator: TradeValidator
+    journal: TradeJournal
+    kill_switch: KillSwitch
+    execution_engine: ExecutionEngine
+    position_monitor: PositionMonitor
+    regime_thresholds: RegimeThresholds | None = None
+
+
+def build_app_state(settings: Settings | None = None) -> AppState:
+    settings = settings or get_settings()
+    client = build_mt5_client(settings)
+    client.connect()
+
+    symbol = client.discover_symbol(settings.symbol_candidate_list())
+    if symbol is None:
+        raise RuntimeError("No tradable symbol found among the configured candidates.")
+    spec = client.get_symbol_spec(symbol)
+
+    market_data = MarketDataEngine(client, settings)
+    journal = TradeJournal(settings.database_url.replace("sqlite:///", ""))
+    kill_switch = KillSwitch(default_active=False)
+    news_filter = build_news_filter(
+        settings.news_calendar_path,
+        minutes_before=settings.news_blackout_minutes_before,
+        minutes_after=settings.news_blackout_minutes_after,
+    )
+    validator = TradeValidator(settings.risk, guard_engine=RiskGuardEngine(settings.risk), news_filter=news_filter)
+    execution_engine = ExecutionEngine(client, spec, settings.trading_mode)
+
+    return AppState(
+        settings=settings,
+        client=client,
+        symbol_spec=spec,
+        market_data=market_data,
+        selector=StrategySelector(),
+        validator=validator,
+        journal=journal,
+        kill_switch=kill_switch,
+        execution_engine=execution_engine,
+        position_monitor=PositionMonitor(),
+    )

@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>XAU/USD Trading Assistant</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: #0e1117; color: #e6e6e6; margin: 0; padding: 24px; }
+  h1 { font-size: 20px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .card { background: #161b22; border: 1px solid #2a2f3a; border-radius: 8px; padding: 16px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: #9aa4b2; margin: 0 0 12px; }
+  .row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 14px; border-bottom: 1px solid #1f242e; }
+  .row:last-child { border-bottom: none; }
+  .row span:first-child { color: #9aa4b2; }
+  .pos { color: #4caf50; } .neg { color: #f44336; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+  .badge.approved { background: #1b5e20; } .badge.rejected { background: #5e1b1b; }
+  .badge.kill-active { background: #b71c1c; } .badge.kill-inactive { background: #263238; }
+  pre { white-space: pre-wrap; font-size: 12px; color: #c9d1d9; margin: 0; }
+  button { background: #2a2f3a; color: #e6e6e6; border: 1px solid #3a4150; border-radius: 4px; padding: 6px 12px; cursor: pointer; }
+  .refresh-note { color: #6b7280; font-size: 12px; margin-bottom: 16px; }
+</style>
+</head>
+<body>
+  <h1>XAU/USD Trading Assistant</h1>
+  <div class="refresh-note">Auto-refreshes every 10s. Read-only view except kill switch controls.</div>
+  <div class="grid" id="grid"></div>
+
+<script>
+async function fetchJSON(url, opts) {
+  const res = await fetch(url, opts);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function card(title, bodyHtml) {
+  return `<div class="card"><h2>${title}</h2>${bodyHtml}</div>`;
+}
+function row(label, value, cls) {
+  return `<div class="row"><span>${label}</span><span class="${cls||''}">${value}</span></div>`;
+}
+function pnlClass(v) { return v >= 0 ? 'pos' : 'neg'; }
+
+async function refresh() {
+  const grid = document.getElementById('grid');
+  try {
+    const [account, market, signal, positions, risk, performance] = await Promise.all([
+      fetchJSON('/api/account'), fetchJSON('/api/market'), fetchJSON('/api/signal'),
+      fetchJSON('/api/positions'), fetchJSON('/api/risk'), fetchJSON('/api/performance'),
+    ]);
+
+    let html = '';
+    html += card('Account', [
+      row('Balance', account.balance.toFixed(2)),
+      row('Equity', account.equity.toFixed(2)),
+      row('Free Margin', account.margin_free.toFixed(2)),
+      row('Daily P/L', account.daily_pnl.toFixed(2), pnlClass(account.daily_pnl)),
+      row('Account Type', account.is_demo === true ? 'DEMO' : account.is_demo === false ? 'REAL-MONEY' : 'UNKNOWN'),
+    ].join(''));
+
+    html += card('Market', [
+      row('Symbol', market.symbol),
+      row('Bid / Ask', `${market.bid} / ${market.ask}`),
+      row('Regime', `${market.regime} (${(market.regime_confidence*100).toFixed(0)}%)`),
+      row('Trend', market.trend_direction),
+      row('ADX', market.adx?.toFixed(1) ?? '—'),
+      row('RSI', market.rsi?.toFixed(1) ?? '—'),
+      row('ATR%', market.atr_pct?.toFixed(2) ?? '—'),
+    ].join(''));
+
+    const sig = signal.signal, val = signal.validation;
+    html += card('Current Signal', [
+      row('Strategy', sig.strategy),
+      row('Direction', sig.direction),
+      row('Score', `${sig.score ?? '—'} ${sig.score_label ?? ''}`),
+      row('Entry / SL / TP', `${sig.entry ?? '—'} / ${sig.stop_loss ?? '—'} / ${sig.take_profit ?? '—'}`),
+      row('R:R', sig.risk_reward ?? '—'),
+      row('Status', `<span class="badge ${val.approved ? 'approved' : 'rejected'}">${val.approved ? 'APPROVED' : 'REJECTED'}</span>`),
+    ].join(''));
+
+    let posHtml = positions.positions.length === 0 ? '<div class="row"><span>No open positions</span></div>' :
+      positions.positions.map(p => row(`${p.direction} ${p.volume} lots`, `SL ${p.stop_loss} / TP ${p.take_profit}`)).join('');
+    html += card('Positions', posHtml);
+
+    html += card('Risk', [
+      row('Daily P/L', `${risk.daily_pnl.toFixed(2)} (${risk.daily_loss_pct.toFixed(2)}%)`, pnlClass(risk.daily_pnl)),
+      row('Weekly P/L', `${risk.weekly_pnl.toFixed(2)} (${risk.weekly_loss_pct.toFixed(2)}%)`, pnlClass(risk.weekly_pnl)),
+      row('Trades Today', risk.trades_today),
+      row('Consecutive Losses', risk.consecutive_losses),
+      row('Kill Switch', `<span class="badge ${risk.kill_switch_active ? 'kill-active' : 'kill-inactive'}">${risk.kill_switch_active ? 'ACTIVE' : 'INACTIVE'}</span>`),
+    ].join('') + `<div style="margin-top:12px"><button onclick="toggleKillSwitch(${risk.kill_switch_active})">${risk.kill_switch_active ? 'Deactivate' : 'Activate'} Kill Switch</button></div>`);
+
+    html += card('Performance', [
+      row('Trades', performance.number_of_trades),
+      row('Win Rate', (performance.win_rate*100).toFixed(0) + '%'),
+      row('Profit Factor', performance.profit_factor === null ? '∞' : performance.profit_factor.toFixed(2)),
+      row('Expectancy', performance.expectancy.toFixed(2)),
+      row('Net Profit', performance.net_profit.toFixed(2), pnlClass(performance.net_profit)),
+      row('Max Drawdown', `${performance.max_drawdown_abs.toFixed(2)} (${(performance.max_drawdown_pct*100).toFixed(1)}%)`),
+    ].join(''));
+
+    html += card('Explanation', `<pre>${signal.explanation.decision}: ${signal.explanation.decision_detail}\n\n${signal.explanation.why_now}</pre>`);
+
+    grid.innerHTML = html;
+  } catch (e) {
+    grid.innerHTML = card('Error', `<pre>${e.message}</pre>`);
+  }
+}
+
+async function toggleKillSwitch(isActive) {
+  const endpoint = isActive ? '/api/kill-switch/deactivate' : '/api/kill-switch/activate';
+  await fetchJSON(endpoint, { method: 'POST' });
+  refresh();
+}
+
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+# Phase 1 dependencies. FastAPI / scikit-learn / scipy are deferred to
+# the phases that actually need them (dashboard, strategy lab), per the
+# "don't build everything simultaneously" development order.
+
+pandas>=2.2
+numpy>=1.26
+pydantic>=2.7
+pydantic-settings>=2.3
+python-dotenv>=1.0
+pytest>=8.0
+
+# Only usable on a host with a real MT5 terminal (Windows, or Wine).
+# Safe to leave uninstalled while MT5_USE_MOCK=true.
+MetaTrader5>=5.0.45 ; sys_platform == "win32"
+
+# Dashboard (Phase "finish fully" — section 33).
+fastapi>=0.115
+uvicorn[standard]>=0.30
+
+# Optional: only needed if you configure ANTHROPIC_API_KEY for the
+# AI layer's LLM-assisted NL config translation / summary polishing
+# (app/ai/llm_client.py). Everything else works without it — uncomment
+# to install.
+# anthropic>=0.40
