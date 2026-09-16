@@ -37,7 +37,7 @@ class TradeValidation:
     lots: float
     spread_ok: bool
     news_ok: bool
-    news_available: bool
+    news_state: str
     daily_loss_limit_ok: bool
     weekly_loss_limit_ok: bool
     position_limit_ok: bool
@@ -61,7 +61,7 @@ class TradeValidation:
             "lots": self.lots,
             "spread_ok": self.spread_ok,
             "news_ok": self.news_ok,
-            "news_available": self.news_available,
+            "news_state": self.news_state,
             "daily_loss_limit_ok": self.daily_loss_limit_ok,
             "weekly_loss_limit_ok": self.weekly_loss_limit_ok,
             "position_limit_ok": self.position_limit_ok,
@@ -102,10 +102,14 @@ class TradeValidator:
 
         guard_result = self.guard_engine.check(guard_input)
         news_status = self.news_filter.check(datetime.now(timezone.utc))
-        # An unavailable news filter is not treated as a blackout (we
-        # don't pretend to know) but the fact it's unavailable is
-        # surfaced honestly in the validation object either way.
-        news_ok = not news_status.blackout_active
+        # SAFETY-CRITICAL: news_ok comes ONLY from NewsStatus.permits_new_trade,
+        # which is True for exactly one state (CLEAR). This replaces a prior
+        # bug where `news_ok = not news_status.blackout_active` silently
+        # evaluated to True when the filter was unavailable (available=False,
+        # blackout_active defaulting to False) -- i.e. "I don't know" was
+        # being treated as "safe". UNAVAILABLE and UNKNOWN now block
+        # identically to BLOCKED; only CLEAR permits a new trade.
+        news_ok = news_status.permits_new_trade
         if not news_ok:
             reasons.append(news_status.reason)
 
@@ -125,7 +129,7 @@ class TradeValidator:
                 lots=0.0,
                 spread_ok=guard_result.checks.get("max_spread_ok", False),
                 news_ok=news_ok,
-                news_available=news_status.available,
+                news_state=news_status.state.value,
                 daily_loss_limit_ok=guard_result.checks.get("daily_loss_ok", False),
                 weekly_loss_limit_ok=guard_result.checks.get("weekly_loss_ok", False),
                 position_limit_ok=guard_result.checks.get("max_open_positions_ok", False),
@@ -184,7 +188,7 @@ class TradeValidator:
             lots=sizing.lots if sizing else 0.0,
             spread_ok=guard_result.checks.get("max_spread_ok", False),
             news_ok=news_ok,
-            news_available=news_status.available,
+            news_state=news_status.state.value,
             daily_loss_limit_ok=guard_result.checks.get("daily_loss_ok", False),
             weekly_loss_limit_ok=guard_result.checks.get("weekly_loss_ok", False),
             position_limit_ok=guard_result.checks.get("max_open_positions_ok", False),

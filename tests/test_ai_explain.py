@@ -11,7 +11,13 @@ from app.risk.guards import GuardCheckInput
 from app.risk.validator import TradeValidator
 from app.config.settings import RiskSettings
 from app.mt5.interface import AccountInfo, SymbolSpec
+from app.news.filter import NewsFilter, NewsState, NewsStatus
 from app.signals.models import Signal, SignalDirection, no_signal
+
+
+class _AlwaysClear(NewsFilter):
+    def check(self, at):
+        return NewsStatus(state=NewsState.CLEAR, reason="No blocking event (test).")
 
 
 def _spec():
@@ -53,7 +59,7 @@ def test_approved_trade_explanation_has_all_sections():
         take_profit=close + 15.0, score=8, score_label="VALID", reasons=["H4 trend confirmed", "Pullback confirmed"],
         meta={"entry_confirmed": True, "quality_confirmed": True},
     )
-    validator = TradeValidator(RiskSettings(_env_file=None))
+    validator = TradeValidator(RiskSettings(_env_file=None), news_filter=_AlwaysClear())
     validation = validator.validate(sig, ctx, _spec(), _account(), _guard_input())
     explanation = explain_trade(sig, ctx.h4_regime, validation)
 

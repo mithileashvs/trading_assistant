@@ -266,7 +266,235 @@ to `UnavailableNewsFilter` automatically — it never pretends to filter
 news it has no data for. See `app/news/calendar.py` for the CSV/JSON
 format and `build_news_filter()`'s fallback behavior.
 
-## Setup for real trading (demo or live)
+## Safety audit (external review pass)
+
+An external safety-focused audit was conducted against this codebase,
+explicitly prioritizing correctness/safety/fail-closed behavior over
+feature velocity. Its process: full repository inspection, run the
+existing suite as a baseline, implement exactly one safety phase at a
+time, re-test, report, and stop for review before continuing — rather
+than pushing through every finding in one pass. This section records
+what's been done under that process so far.
+
+**Phase 1 — Multi-timeframe data consistency (implemented).** The
+audit correctly identified that `MockMT5Client.get_ohlcv()` generated
+H4, H1, and M15 as independently-seeded random walks (seeded by
+`hash((symbol, timeframe))`) — they did not represent the same
+underlying market timeline. This is a real safety issue for any
+multi-timeframe strategy: H4 trend and M15 entry timing could
+legitimately disagree not because the market actually showed
+conflicting signals, but because the mock's H4 and M15 series had no
+relationship to each other at all. **Fixed**: the mock now generates a
+single coherent M15 series per symbol (seeded by symbol only) and
+derives H1/H4 by resampling that same series — verified by tests that
+aggregate the returned M15 bars and assert byte-for-byte equality
+against the returned H1/H4 bars, not just statistical similarity. This
+did not affect `app/backtesting/engine.py`, which already resampled
+correctly from a single M15 window (built in an earlier phase); it
+also does not affect `RealMT5Client`, where a real broker's own
+timeframes are inherently coherent.
+
+Fixing this **surfaced two further pre-existing latent bugs** it had
+been masking:
+
+1. `MarketDataEngine`'s data-freshness check used one flat staleness
+   threshold for every timeframe, which only ever worked because the
+   old (buggy) mock artificially anchored every timeframe's last bar
+   to within a minute of "now" regardless of realism. Once H1/H4 bars
+   had realistic bucket timestamps (a bar's timestamp is its OPEN
+   time — legitimately up to a full bar-period old), the flat
+   threshold began rejecting perfectly fresh H1/H4 data as stale,
+   which would have blocked all multi-timeframe trading. **Fixed**:
+   the freshness check is now timeframe-aware (`bar_period +
+   configured_buffer`), with unrecognized timeframes defaulting to the
+   *strictest* known bar period (fail closed — more likely to reject,
+   never more likely to silently accept stale data).
+2. The mock's random-walk seeding used Python's built-in `hash()` on
+   the symbol string. Python randomizes string hashing per process by
+   default (`PYTHONHASHSEED`, a security feature) — so the "same" seed
+   silently produced a *different* price path every fresh process run,
+   even though it stayed internally consistent within one process's
+   lifetime. This was invisible with the old short, independently-reseeded-
+   per-call walks (little accumulated drift), but the coherence fix's
+   20,000-bar shared base series accumulates enough drift that the
+   resulting "current price" could swing by hundreds of dollars
+   between process runs — which caused a real, intermittently-failing
+   test (`test_position_closes_on_stop_loss_hit_and_journal_updated`,
+   caught by running it as 10 independent fresh processes, not just
+   in-process reruns). **Fixed**: seeding now uses `zlib.crc32`
+   (process-stable) instead of `hash()`. Verified by a regression test
+   that spawns three genuinely separate Python processes and asserts
+   they all produce the identical price path.
+
+Both original fixes are in `app/mt5/mock_client.py` and
+`app/market_data/engine.py`; the hash-seeding fix is also in
+`app/mt5/mock_client.py`. Tests added in `tests/test_mock_mt5_client.py`
+and `tests/test_market_data_engine.py`. Full suite: **313 tests
+passing, 0 regressions, confirmed stable across two independent
+fresh-process full-suite runs** (baseline before this pass: 298).
+
+**Phase 3 — Independent Safety Gate (implemented).** Per the audit's
+architecture diagram (`RISK ENGINE -> SAFETY GATE -> EXECUTION SAFETY
+GATE -> MT5`) and the "two independent validations" principle: a
+second, **structurally separate** approval layer now sits above the
+risk engine. `app/safety/gate.py`'s `SafetyGate` does not import or
+call into `app.risk` at all — enforced by a test that AST-parses the
+module and asserts no such import exists, not just a docstring
+promise. It re-derives its own verdict on the same class of hard
+constraints (kill switch, account/symbol trade permission, spread,
+daily loss, position limits, stop-loss presence and directional
+validity, broker minimum stop distance, take-profit direction, volume
+against broker min/max/step) from its own code, so a bug in one layer
+is unlikely to also exist in the other.
+
+`TradingLoop` now calls `SafetyGate.evaluate()` immediately before
+every order submission, using **freshly re-gathered** account/tick/
+news/position state (not reused from the risk-engine validation a
+moment earlier) — per section 19's "do not assume conditions remain
+unchanged since signal generation." A trade proceeds only if BOTH the
+risk engine and the safety gate independently approve; either
+rejecting blocks the trade, and any internal error inside the gate is
+itself treated as a rejection (fail closed, never a pass-through).
+
+**Concretely demonstrated, not just asserted**: I constructed a
+scenario where the risk engine approves a trade — because
+`TradeValidator`/`RiskGuardEngine` never check the broker's minimum
+stop distance (`stops_level_points`) at all — and confirmed
+`SafetyGate` independently catches and rejects it, blocking the trade
+end-to-end through the real `TradingLoop`. This is exactly the
+property section 18 requires, verified as actual behavior rather than
+assumed from the code reading correctly. The corresponding regression
+test is
+`tests/test_trading_loop.py::test_safety_gate_can_reject_even_when_risk_engine_approves`.
+
+**A real design bug caught and fixed while wiring this in**: the first
+wiring attempt gave `TradingLoop` two separate attributes that both
+needed to hold "the configured news filter" (one on the validator, one
+believed-shared with the safety gate) — reassigning one in a test
+silently left the other stale, so the safety gate was checking a
+different news filter than intended. This is exactly the kind of
+subtle bug independent validation is supposed to catch, and it
+surfaced during this phase's own development. Fixed by making
+`news_filter` a property on `TradingLoop` that delegates to the
+validator's single stored instance, so there is only ever one
+canonical value to set.
+
+Files changed/added: `app/safety/gate.py` (new), `app/safety/__init__.py`
+(new), `app/runtime/loop.py` (SafetyGate wired in, `news_filter`
+property fix), `app/logging_config.py` (`SAFETY_REJECT`/`RISK_REJECT`
+event types added), `tests/test_safety_gate.py` (new, 26 tests),
+`tests/test_trading_loop.py` (+2 tests: the news-filter-property
+regression test and the risk-engine-approves-but-safety-gate-rejects
+integration test). Full suite: **346 tests passing, 3 pre-existing
+skips, 0 regressions** (baseline before this phase: 318).
+
+**Phase 4 — Execution Safety Gate (implemented).** Per section 56
+("NO DIRECT STRATEGY -> MT5 ACCESS") and the architecture diagram's
+third gate (`SAFETY GATE -> EXECUTION SAFETY GATE -> MT5`): Phase 3's
+`SafetyGate` is only enforced because `TradingLoop`'s orchestration
+logic happens to call it before deciding to submit. That left a real
+gap — any OTHER caller of `ExecutionEngine.submit_market_order()`
+(a future "manual trade" UI button, a bug, a different orchestrator)
+would completely bypass both the risk engine and `SafetyGate`, since
+nothing forced callers to check first.
+
+**Fixed**: `app/execution/execution_safety_gate.py`'s
+`ExecutionSafetyGate` is now called from *inside*
+`ExecutionEngine.submit_market_order()` itself — unconditionally,
+before that function ever touches `client.submit_order()` or
+fabricates a paper fill. This makes bypass structurally impossible
+rather than merely against convention: every present and future caller
+of that one function inherits the check automatically, because there
+is no other path to MT5 submission. It re-checks kill switch, account/
+symbol trade permission, direction validity, stop-loss presence,
+market-data freshness, and volume against broker min/max/step, using
+state gathered fresh at the moment of the call.
+
+**Concretely demonstrated**: I called `ExecutionEngine.submit_market_order()`
+*directly*, with an active kill switch, completely bypassing
+`TradeValidator` and `SafetyGate` — and confirmed it was still
+correctly rejected (`EXECUTION_SAFETY_GATE_REJECTED: Kill switch is
+active.`, no position created). Same result for a missing stop-loss
+and an out-of-range volume called directly. These are permanent
+regression tests in `tests/test_execution_safety_gate.py`, not just
+manual checks.
+
+**Design note on the kill switch default**: `ExecutionEngine` now
+accepts an optional `kill_switch` parameter. If none is provided, it
+uses a deliberately inert `_NullKillSwitch` rather than defaulting to
+a real file-backed `KillSwitch` — defaulting to a shared file path
+would mean every standalone `ExecutionEngine` (tests, ad-hoc scripts)
+silently inherits whatever kill-switch state happens to be on disk,
+which is a correctness and test-isolation hazard, not a safety
+improvement. `TradingLoop` (the actual production entry point) always
+passes its own properly-scoped `KillSwitch` explicitly, so the real
+deployment path is fully protected; this is documented plainly in the
+code rather than left implicit.
+
+Files changed/added: `app/execution/execution_safety_gate.py` (new),
+`app/execution/engine.py` (gate wired in, `_NullKillSwitch` default),
+`app/execution/__init__.py`, `app/runtime/loop.py` (passes its
+`KillSwitch` into `ExecutionEngine`), `tests/test_execution_safety_gate.py`
+(new, 19 tests). Full suite: **365 tests passing, 3 pre-existing
+skips, 0 regressions** (baseline before this phase: 346).
+
+**Confirmed, not yet fixed:**
+- **No consolidated StartupSafetyCheck** module.
+- **Unknown MT5 order results** aren't yet triaged into
+  `ORDER_NOT_SENT` / `ORDER_SENT_UNKNOWN_RESULT` / `ORDER_CONFIRMED`.
+
+This system has not undergone the audit's full review, and —
+regardless of test count — **is not represented as ready for live
+trading**. See "No false safety claims" in the Philosophy section
+below.
+
+**Phase 2 — News state semantics (implemented).** The audit correctly
+identified a dangerous ambiguity: `NewsStatus` exposed two independent
+booleans (`available`, `blackout_active`), and `TradeValidator`
+derived safety as `news_ok = not blackout_active`. An unavailable news
+filter reports `available=False`, and `blackout_active` defaults to
+`False` — so `news_ok` silently evaluated to `True`. **This was a
+live, exploitable bug**, not a hypothetical: with the *default*
+configuration (no calendar file set — which is the out-of-the-box
+state), every trade validation up to this point in the project would
+have proceeded as if news were confirmed clear, when in fact nothing
+had confirmed anything.
+
+**Fixed**: `NewsStatus` now carries an explicit `NewsState` enum
+(`CLEAR` / `BLOCKED` / `UNAVAILABLE` / `UNKNOWN`) instead of two
+booleans, with exactly one state (`CLEAR`) permitting a new trade —
+enforced via a `permits_new_trade` property rather than a boolean
+callers recompute themselves, specifically so this bug class can't
+silently reappear the next time someone touches this code.
+`CalendarNewsFilter` also now tracks its own coverage window and
+returns `UNKNOWN` (not `CLEAR`) for any query outside the time range
+its loaded events actually span — "no events listed near this time"
+is a different claim from "the calendar confirms nothing is scheduled
+near this time," and a calendar file that simply hasn't been refreshed
+far enough into the future can't honestly make the second claim.
+
+**Major, deliberate behavioral consequence**: with this fix, the
+system's out-of-the-box default configuration (no `NEWS_CALENDAR_PATH`
+set) now **permanently blocks every new trade** — `UnavailableNewsFilter`
+reports `UNAVAILABLE`, which never permits approval. This is not a
+regression; it is section 27's explicit rule ("UNAVAILABLE: no new
+trade") working as specified. A real deployment must configure an
+actual news calendar (`app/news/calendar.py`) before the system can
+ever approve a trade. Every test and code path that previously
+exercised "signal gets approved" now explicitly injects a stub
+clear-news filter to test that path in isolation — see
+`tests/test_trading_loop.py::test_default_news_filter_blocks_all_new_trades`
+for the direct regression test proving the new default behavior, and
+grep for `_AlwaysClear` across the test suite for how the "happy path"
+tests now make that override explicit rather than relying on it being
+the accidental default.
+
+Files changed: `app/news/filter.py` (rewritten), `app/news/calendar.py`,
+`app/risk/validator.py`, plus five test files updated to reflect the
+corrected (stricter) default. Full suite: **318 tests passing, 3
+pre-existing skips, 0 regressions** (baseline before this phase: 313).
+
+
 
 1. Get a real MT5 terminal running (Windows, or Wine) with a **demo
    account** logged in first. Never start with a real-money account.
@@ -597,3 +825,14 @@ NO_TRADE is a first-class decision, not a failure state. Risk
 management has priority over signal generation. The AI layer will
 never be able to bypass the risk engine, trade validator, kill switch,
 or daily loss limit — those are deterministic and final.
+
+**No false safety claims.** This software is never described as
+"safe," "guaranteed," or "risk-free" — absolute safety cannot be
+guaranteed, and nothing here should be read as claiming it. Where a
+component's checks pass, that means exactly one specific thing: the
+defined deterministic checks passed at that moment. It does not mean
+the trade is safe, or that the system is ready for real money. Trading
+financial markets involves substantial risk of loss, this codebase is
+an engineering exercise in a sandboxed environment with no verified
+live-broker testing (see the MT5 and safety-audit sections above), and
+"tests passing" is not evidence of live-trading readiness.

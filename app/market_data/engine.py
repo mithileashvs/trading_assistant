@@ -19,6 +19,16 @@ import pandas as pd
 from app.config.settings import Settings
 from app.mt5.interface import IMT5Client, SymbolSpec, Tick
 
+# Bar duration per timeframe, used to make the freshness check
+# timeframe-aware (section 9/63/3.1: a stale-data check that assumes
+# every timeframe's last bar should be within a couple minutes of "now"
+# is wrong for H1/H4 -- a bar's timestamp is its OPEN time, so it
+# legitimately stays "current" for its own full duration). Unknown
+# timeframes default to the SMALLEST known duration (M15) rather than
+# guessing large, so an unrecognized timeframe fails closed (stricter,
+# more likely to reject) instead of silently tolerating stale data.
+_TIMEFRAME_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440}
+
 
 class SymbolDiscoveryError(RuntimeError):
     pass
@@ -67,7 +77,7 @@ class MarketDataEngine:
     def get_ohlcv(self, timeframe: str, count: int) -> pd.DataFrame:
         symbol = self.resolve_symbol().name
         df = self._client.get_ohlcv(symbol, timeframe, count)
-        self._assert_fresh(df)
+        self._assert_fresh(df, timeframe)
         return df
 
     def get_tick(self) -> Tick:
@@ -77,21 +87,24 @@ class MarketDataEngine:
         return tick
 
     # -- freshness checks (section 35: "stale market data" is a failure mode) --
-    def _assert_fresh(self, df: pd.DataFrame) -> None:
+    def _assert_fresh(self, df: pd.DataFrame, timeframe: str = "M15") -> None:
         if df.empty:
             raise StaleMarketDataError("OHLCV frame is empty.")
         last_ts = df.index[-1]
         if last_ts.tzinfo is None:
             last_ts = last_ts.tz_localize(timezone.utc)
         age = (datetime.now(timezone.utc) - last_ts).total_seconds()
-        max_age = self._settings.market_data_max_staleness_seconds
-        # Note: for lower timeframes this check needs a timeframe-aware
-        # threshold in later phases (an H4 candle is legitimately "old"
-        # for most of its 4-hour life). Phase 1 uses a single global
-        # threshold intended for near-real-time (M15 and below) checks.
+
+        # The last bar's timestamp is its OPEN time, so it remains
+        # "current" for its own full bar-period before the next bar
+        # starts -- the freshness budget must be at least that long,
+        # plus the configured buffer on top for feed/processing lag.
+        bar_minutes = _TIMEFRAME_MINUTES.get(timeframe, _TIMEFRAME_MINUTES["M15"])
+        max_age = bar_minutes * 60 + self._settings.market_data_max_staleness_seconds
         if age > max_age:
             raise StaleMarketDataError(
-                f"Last candle is {age:.0f}s old, exceeds max staleness of {max_age}s."
+                f"Last {timeframe} candle is {age:.0f}s old, exceeds max staleness of {max_age:.0f}s "
+                f"({bar_minutes}min bar period + {self._settings.market_data_max_staleness_seconds}s buffer)."
             )
 
     def _assert_tick_fresh(self, tick: Tick) -> None:

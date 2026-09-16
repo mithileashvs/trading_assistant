@@ -31,6 +31,7 @@ from app.regimes.thresholds import RegimeThresholds
 from app.risk.guards import GuardCheckInput, RiskGuardEngine
 from app.risk.kill_switch import KillSwitch
 from app.risk.validator import TradeValidator
+from app.safety.gate import SafetyGate, SafetyGateInput
 from app.signals.models import SignalDirection
 from app.strategies.context import build_context
 from app.strategies.selector import StrategySelector
@@ -42,6 +43,7 @@ class CycleSummary:
     regime: Optional[str] = None
     signal_direction: Optional[str] = None
     signal_approved: Optional[bool] = None
+    safety_gate_approved: Optional[bool] = None
     actions_taken: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -84,7 +86,14 @@ class TradingLoop:
         self.regime_thresholds = regime_thresholds
         self.journal = journal
         self.position_monitor = position_monitor or PositionMonitor()
-        self.execution_engine = execution_engine or ExecutionEngine(client, symbol_spec, settings.trading_mode)
+        # kill_switch is constructed before execution_engine specifically
+        # so the default ExecutionEngine can be given the SAME instance
+        # (see ExecutionEngine's _NullKillSwitch docstring for why a
+        # freshly-defaulted, unrelated KillSwitch would be unsafe here).
+        self.kill_switch = kill_switch or KillSwitch(default_active=False)
+        self.execution_engine = execution_engine or ExecutionEngine(
+            client, symbol_spec, settings.trading_mode, kill_switch=self.kill_switch
+        )
         self.validator = TradeValidator(
             settings.risk,
             guard_engine=RiskGuardEngine(settings.risk),
@@ -94,7 +103,18 @@ class TradingLoop:
                 minutes_after=settings.news_blackout_minutes_after,
             ),
         )
-        self.kill_switch = kill_switch or KillSwitch(default_active=False)
+        # Independent second gate (audit sections 17-18): deliberately a
+        # SEPARATE code path from self.validator, re-checking freshly
+        # gathered state right before order submission. Even when the
+        # risk engine has approved, this can still reject -- and that
+        # rejection is final. Note: it reads news state via
+        # self.validator.news_filter (the single source of truth for
+        # "the configured news filter") rather than holding its own
+        # separate reference -- two attributes that both need to be
+        # kept in sync on override is exactly the kind of footgun that
+        # caused a real test bug during this phase's own development
+        # (see the README's safety-audit section).
+        self.safety_gate = SafetyGate()
 
         self._journal_trade_ids: dict[int, int] = {}  # execution ticket -> journal row id
         self._current_day = None
@@ -107,6 +127,21 @@ class TradingLoop:
             self.account_safety_note = describe_account_safety(account, settings.trading_mode)
         except Exception:  # noqa: BLE001 - best-effort; run_once() will surface real connection errors
             self.account_safety_note = "Could not determine account safety status at startup."
+
+    @property
+    def news_filter(self):
+        """The single source of truth for the configured news filter is
+        self.validator.news_filter -- this property exists so
+        `loop.news_filter = X` (a natural thing to write, especially in
+        tests) always changes the SAME object SafetyGate reads from,
+        instead of silently creating a second, divergent reference.
+        (That divergence was a real bug caught while wiring SafetyGate
+        into this loop -- see the README's safety-audit section.)"""
+        return self.validator.news_filter
+
+    @news_filter.setter
+    def news_filter(self, value) -> None:
+        self.validator.news_filter = value
 
     def _refresh_equity_baselines(self, equity: float, now: datetime) -> None:
         day = now.date()
@@ -249,6 +284,20 @@ class TradingLoop:
         if not validation.approved or best.direction == SignalDirection.NO_SIGNAL:
             return
 
+        # --- Independent Safety Gate (audit sections 17-19) ------------------------
+        # A SEPARATE approval, from freshly-gathered state (not reused
+        # from `validation`/`guard_input` above) -- time has passed since
+        # the risk engine's check, however briefly, and this gate exists
+        # specifically to not assume nothing changed in that window.
+        safety_result = self._run_safety_gate(best, validation, now)
+        summary.safety_gate_approved = safety_result.approved
+        if not safety_result.approved:
+            summary.errors.append(
+                f"SafetyGate rejected the trade (error={safety_result.is_error}): "
+                + "; ".join(safety_result.reasons)
+            )
+            return
+
         client_order_id = f"{self.symbol_spec.name}-{now.isoformat()}-{best.strategy}"
         monetary_risk = account.equity * (self.settings.risk.risk_per_trade_pct / 100.0)
         result, position = self.execution_engine.submit_market_order(
@@ -272,6 +321,58 @@ class TradingLoop:
         ))
         self._journal_trade_ids[position.ticket] = journal_id
         summary.actions_taken.append(f"Opened {position.direction} ticket {position.ticket} ({position.strategy}).")
+
+    def _run_safety_gate(self, signal, validation, now: datetime):
+        """Builds a SafetyGateInput from FRESHLY gathered state (not
+        reused from the risk-engine validation above) and runs it
+        through the independent SafetyGate. Any exception while
+        gathering this fresh state is itself treated as a safety
+        failure, not allowed to propagate and accidentally skip the
+        gate."""
+        try:
+            fresh_account = self.client.get_account_info()
+            fresh_tick = self.market_data.get_tick()
+            fresh_news_status = self.news_filter.check(now)
+            fresh_open_positions = len(self.execution_engine.get_open_positions())
+
+            day_start_equity = self._day_start_equity or fresh_account.equity
+            daily_pnl = fresh_account.equity - day_start_equity
+            daily_loss_pct = (-daily_pnl / day_start_equity * 100.0) if daily_pnl < 0 and day_start_equity > 0 else 0.0
+
+            spread_points = (fresh_tick.ask - fresh_tick.bid) / self.symbol_spec.tick_size if self.symbol_spec.tick_size else 0.0
+
+            gate_input = SafetyGateInput(
+                account_equity=fresh_account.equity,
+                account_trade_allowed=fresh_account.trade_allowed,
+                account_is_demo=fresh_account.is_demo,
+                symbol_trade_allowed=self.symbol_spec.trade_allowed,
+                volume_min=self.symbol_spec.volume_min,
+                volume_max=self.symbol_spec.volume_max,
+                volume_step=self.symbol_spec.volume_step,
+                stops_level_points=self.symbol_spec.stops_level_points,
+                tick_size=self.symbol_spec.tick_size,
+                direction=signal.direction.value,
+                volume=validation.lots,
+                entry_price=signal.entry,
+                stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit,
+                current_spread_points=spread_points,
+                max_spread_points=self.settings.risk.max_spread_points,
+                market_data_fresh=True,
+                news_state=fresh_news_status.state,
+                kill_switch_active=self.settings.kill_switch or self.kill_switch.is_active(),
+                daily_loss_pct=daily_loss_pct,
+                max_daily_loss_pct=self.settings.risk.max_daily_loss_pct,
+                open_positions_count=fresh_open_positions,
+                max_open_positions=self.settings.risk.max_open_positions,
+            )
+            return self.safety_gate.evaluate(gate_input)
+        except Exception as exc:  # noqa: BLE001 - gathering-failure also fails closed
+            from app.safety.gate import SafetyGateResult
+            return SafetyGateResult(
+                approved=False, is_error=True, checks={},
+                reasons=[f"Could not gather fresh state for the safety gate: {exc}"],
+            )
 
     def run(self, iterations: int, sleep_seconds: float = 60.0) -> list[CycleSummary]:
         summaries = []

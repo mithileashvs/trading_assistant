@@ -11,6 +11,15 @@ order path, it only reads market data through the client.
 Duplicate-order protection is enforced via client_order_id: submitting
 the same client_order_id twice returns the first result's ticket
 without submitting a second order.
+
+EXECUTION SAFETY GATE (audit sections 19, 54-56): submit_market_order()
+calls ExecutionSafetyGate internally, unconditionally, before EVER
+reaching client.submit_order() or fabricating a paper fill. This is
+deliberate placement, not just an extra check — it's what makes
+bypassing the safety gates structurally impossible rather than merely
+against convention: any caller of submit_market_order(), present or
+future, inherits this check automatically, because there is no path
+to MT5 submission that doesn't go through this exact function.
 """
 from __future__ import annotations
 
@@ -21,11 +30,27 @@ from typing import Optional
 
 from app.backtesting.costs import ExecutionCosts, apply_entry_costs, apply_exit_costs, commission_cost
 from app.config.settings import TradingMode
+from app.execution.execution_safety_gate import ExecutionSafetyGate, ExecutionSafetyGateInput
 from app.mt5.interface import IMT5Client, OrderRequest, OrderResult, Position, SymbolSpec, Tick
 
 
 class DuplicateOrderError(RuntimeError):
     pass
+
+
+class _NullKillSwitch:
+    """The default when ExecutionEngine is constructed without an
+    explicit kill_switch. Deliberately NOT a file-backed KillSwitch --
+    defaulting to one would mean every standalone ExecutionEngine
+    (tests, ad-hoc scripts) silently shares whatever state happens to
+    be on disk at the default path, which is a real test-isolation and
+    correctness hazard. Production entry points (TradingLoop) always
+    pass their own properly-scoped KillSwitch explicitly; this null
+    object is only for callers that haven't wired one in, and it is
+    intentionally, visibly inert rather than pretending to protect."""
+
+    def is_active(self) -> bool:
+        return False
 
 
 @dataclass
@@ -55,11 +80,14 @@ class ExecutionEngine:
         symbol_spec: SymbolSpec,
         mode: TradingMode,
         costs: ExecutionCosts | None = None,
+        kill_switch=None,
     ):
         self.client = client
         self.symbol_spec = symbol_spec
         self.mode = mode
         self.costs = costs or ExecutionCosts()
+        self.kill_switch = kill_switch or _NullKillSwitch()
+        self._exec_safety_gate = ExecutionSafetyGate()
         self._seen_client_order_ids: dict[str, int] = {}  # client_order_id -> ticket
         self._paper_positions: dict[int, ManagedPosition] = {}
         self._paper_ticket_counter = itertools.count(start=900_000_000)
@@ -82,11 +110,49 @@ class ExecutionEngine:
     ) -> tuple[OrderResult, Optional[ManagedPosition]]:
         # Duplicate-order protection (section 21, section 16): the same
         # client_order_id is never submitted twice, in either mode.
+        # Kept as its own early return (distinct DUPLICATE_ORDER_REJECTED
+        # comment) rather than folded into the safety gate's generic
+        # rejection, so callers can keep relying on that exact signal.
         if client_order_id in self._seen_client_order_ids:
             ticket = self._seen_client_order_ids[client_order_id]
             return (
                 OrderResult(success=False, order_id=ticket, deal_id=None, price=None,
                             volume=None, retcode=-1, comment="DUPLICATE_ORDER_REJECTED"),
+                None,
+            )
+
+        # --- Execution Safety Gate: the final, unconditional check before
+        # this function does ANYTHING else toward submitting an order. ---
+        try:
+            account = self.client.get_account_info()
+        except Exception as exc:  # noqa: BLE001 - can't gather fresh state -> fail closed
+            return (
+                OrderResult(success=False, order_id=None, deal_id=None, price=None, volume=None,
+                            retcode=-1, comment=f"EXECUTION_SAFETY_GATE_REJECTED: could not fetch account info: {exc}"),
+                None,
+            )
+
+        gate_input = ExecutionSafetyGateInput(
+            is_duplicate=False,  # already handled above; gate still carries the field for completeness
+            kill_switch_active=self.kill_switch.is_active(),
+            account_trade_allowed=account.trade_allowed,
+            symbol_trade_allowed=self.symbol_spec.trade_allowed,
+            direction=direction,
+            volume=volume,
+            volume_min=self.symbol_spec.volume_min,
+            volume_max=self.symbol_spec.volume_max,
+            volume_step=self.symbol_spec.volume_step,
+            stop_loss=stop_loss,
+            market_data_fresh=True,
+        )
+        gate_result = self._exec_safety_gate.evaluate(gate_input)
+        if not gate_result.approved:
+            return (
+                OrderResult(
+                    success=False, order_id=None, deal_id=None, price=None, volume=None, retcode=-1,
+                    comment=f"EXECUTION_SAFETY_GATE_REJECTED: {'; '.join(gate_result.reasons)}",
+                    raw=gate_result.to_dict(),
+                ),
                 None,
             )
 

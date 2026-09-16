@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import strategy_test_helpers as h
 from app.config.settings import RiskSettings
 from app.mt5.interface import AccountInfo, SymbolSpec
-from app.news.filter import NewsFilter, NewsStatus
+from app.news.filter import NewsFilter, NewsState, NewsStatus
 from app.risk.guards import GuardCheckInput
 from app.risk.validator import TradeValidator
 from app.signals.models import Signal, SignalDirection
@@ -55,7 +55,17 @@ def _approvable_signal(ctx) -> Signal:
 
 class _AlwaysBlackout(NewsFilter):
     def check(self, at):
-        return NewsStatus(available=True, blackout_active=True, reason="High-impact event window (test).")
+        return NewsStatus(state=NewsState.BLOCKED, reason="High-impact event window (test).")
+
+
+class _AlwaysUnknown(NewsFilter):
+    def check(self, at):
+        return NewsStatus(state=NewsState.UNKNOWN, reason="Outside calendar coverage (test).")
+
+
+class _AlwaysClear(NewsFilter):
+    def check(self, at):
+        return NewsStatus(state=NewsState.CLEAR, reason="No blocking event (test).")
 
 
 def test_no_signal_is_never_approved():
@@ -69,9 +79,14 @@ def test_no_signal_is_never_approved():
 
 
 def test_healthy_signal_is_approved():
+    """Approval now requires an EXPLICIT clear news source -- the
+    default UnavailableNewsFilter correctly blocks (see
+    test_unavailable_news_filter_blocks_approval), so a "genuinely
+    everything is healthy" scenario must supply one that actually
+    confirms CLEAR."""
     ctx = h.trend_pullback_context(bullish=True)
     sig = _approvable_signal(ctx)
-    validator = TradeValidator(_risk_settings())
+    validator = TradeValidator(_risk_settings(), news_filter=_AlwaysClear())
     v = validator.validate(sig, ctx, _symbol_spec(), _account(), _guard_input())
     assert v.approved is True
     assert v.lots > 0
@@ -133,16 +148,35 @@ def test_news_blackout_blocks_approval():
     v = validator.validate(sig, ctx, _symbol_spec(), _account(), _guard_input())
     assert v.approved is False
     assert v.news_ok is False
-    assert v.news_available is True
+    assert v.news_state == "BLOCKED"
 
 
-def test_unavailable_news_filter_does_not_block_by_default():
+def test_unavailable_news_filter_blocks_approval():
+    """This is the core safety-fix regression test: an unavailable news
+    filter must BLOCK new trades, not silently be treated as "no
+    blackout, so it's fine" (the exact bug the audit flagged --
+    news_available=false previously evaluated to news_ok=true)."""
     ctx = h.trend_pullback_context(bullish=True)
     sig = _approvable_signal(ctx)
     validator = TradeValidator(_risk_settings())  # default UnavailableNewsFilter
     v = validator.validate(sig, ctx, _symbol_spec(), _account(), _guard_input())
-    assert v.news_available is False
-    assert v.news_ok is True  # unavailable != blackout
+    assert v.news_state == "UNAVAILABLE"
+    assert v.news_ok is False
+    assert v.approved is False
+    assert any("unavailable" in r.lower() for r in v.rejection_reasons)
+
+
+def test_unknown_news_state_blocks_approval():
+    """UNKNOWN must block identically to BLOCKED and UNAVAILABLE --
+    "a data source exists but can't confidently answer" is still not
+    "confirmed clear.\""""
+    ctx = h.trend_pullback_context(bullish=True)
+    sig = _approvable_signal(ctx)
+    validator = TradeValidator(_risk_settings(), news_filter=_AlwaysUnknown())
+    v = validator.validate(sig, ctx, _symbol_spec(), _account(), _guard_input())
+    assert v.news_state == "UNKNOWN"
+    assert v.news_ok is False
+    assert v.approved is False
 
 
 def test_position_too_small_blocks_approval():

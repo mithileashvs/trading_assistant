@@ -53,6 +53,16 @@ def test_signal_endpoint_shape(client):
     assert "decision" in data["explanation"]
 
 
+def test_startup_safety_endpoint_shape(client):
+    r = client.get("/api/startup-safety")
+    assert r.status_code == 200
+    data = r.json()
+    for key in ("overall_status", "mode", "monitoring_only", "checks", "failed_checks", "warnings", "timestamp"):
+        assert key in data
+    assert data["overall_status"] in {"TRADING_ALLOWED", "TRADING_BLOCKED"}
+    assert isinstance(data["checks"], list) and len(data["checks"]) > 0
+
+
 def test_positions_endpoint_empty_initially(client):
     r = client.get("/api/positions")
     assert r.status_code == 200

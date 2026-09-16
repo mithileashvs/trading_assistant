@@ -20,6 +20,8 @@ EVENT_TYPES = {
     "SIGNAL_GENERATED",
     "SIGNAL_REJECTED",
     "RISK_CHECK",
+    "RISK_REJECT",
+    "SAFETY_REJECT",
     "ORDER_SUBMITTED",
     "ORDER_FILLED",
     "ORDER_REJECTED",
@@ -30,6 +32,7 @@ EVENT_TYPES = {
     "MT5_CONNECT",
     "MT5_DISCONNECT",
     "SYMBOL_DISCOVERY",
+    "STARTUP_SAFETY",
 }
 
 _SECRET_KEYS = {"password", "mt5_password", "api_key", "token", "secret"}

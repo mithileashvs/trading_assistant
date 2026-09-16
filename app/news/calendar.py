@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from app.news.filter import NewsFilter, NewsStatus
+from app.news.filter import NewsFilter, NewsState, NewsStatus
 
 _HIGH_IMPACT_KEYWORDS = {
     "CPI", "NFP", "NONFARM", "FOMC", "INTEREST RATE", "RATE DECISION",
@@ -99,6 +99,14 @@ class CalendarNewsFilter(NewsFilter):
     events never trigger a blackout; that threshold is deliberately
     not configurable per-event here to keep behavior predictable, but
     the whole filter is opt-in per instance.
+
+    COVERAGE AWARENESS: this filter only ever has confident knowledge
+    within the time range its loaded events actually span. A query for
+    a time outside that range returns NewsState.UNKNOWN, not CLEAR —
+    "no events listed near this time" is not the same claim as "the
+    calendar confirms there's nothing scheduled near this time"; a
+    calendar file that simply hasn't been refreshed far enough into
+    the future can't honestly make the second claim.
     """
 
     def __init__(
@@ -107,11 +115,18 @@ class CalendarNewsFilter(NewsFilter):
         minutes_before: int = 30,
         minutes_after: int = 30,
         symbol_currencies: tuple[str, ...] = ("USD", "XAU"),
+        coverage_buffer_hours: float = 6.0,
     ):
         self._events = sorted(events, key=lambda e: e.time)
         self.minutes_before = minutes_before
         self.minutes_after = minutes_after
         self.symbol_currencies = symbol_currencies
+        # How far beyond the earliest/latest listed event (of ANY
+        # impact level -- even a low-impact entry confirms the
+        # calendar creator considered that date) we still trust the
+        # calendar's silence as meaning "confirmed clear," not just
+        # "not checked that far out."
+        self.coverage_buffer_hours = coverage_buffer_hours
 
     @classmethod
     def from_file(cls, path: str, **kwargs) -> "CalendarNewsFilter":
@@ -123,20 +138,45 @@ class CalendarNewsFilter(NewsFilter):
             if e.impact == "HIGH" and (not e.currency or e.currency.upper() in self.symbol_currencies)
         ]
 
+    def _coverage_range(self) -> tuple[datetime, datetime] | None:
+        if not self._events:
+            return None
+        return self._events[0].time, self._events[-1].time
+
     def check(self, at: datetime) -> NewsStatus:
         if at.tzinfo is None:
             at = at.replace(tzinfo=timezone.utc)
+
+        coverage = self._coverage_range()
+        if coverage is None:
+            return NewsStatus(
+                state=NewsState.UNKNOWN,
+                reason="Calendar contains no events at all; its coverage window cannot be determined, "
+                       "so 'no blocking events' cannot be confirmed.",
+            )
+        coverage_start, coverage_end = coverage
+        buffer = timedelta(hours=self.coverage_buffer_hours)
+        if at < coverage_start - buffer or at > coverage_end + buffer:
+            return NewsStatus(
+                state=NewsState.UNKNOWN,
+                reason=f"Requested time {at.isoformat()} is outside the calendar's known coverage window "
+                       f"({coverage_start.isoformat()} to {coverage_end.isoformat()}); cannot confirm "
+                       "there is no blocking event near this time.",
+            )
 
         for event in self._relevant_high_impact_events():
             window_start = event.time - timedelta(minutes=self.minutes_before)
             window_end = event.time + timedelta(minutes=self.minutes_after)
             if window_start <= at <= window_end:
                 return NewsStatus(
-                    available=True, blackout_active=True,
+                    state=NewsState.BLOCKED,
                     reason=f"High-impact event '{event.name}' at {event.time.isoformat()} "
                            f"(blackout window {self.minutes_before}min before / {self.minutes_after}min after).",
                 )
-        return NewsStatus(available=True, blackout_active=False, reason="No high-impact event within the blackout window.")
+        return NewsStatus(
+            state=NewsState.CLEAR,
+            reason="No high-impact event within the blackout window; requested time is within calendar coverage.",
+        )
 
     def upcoming_high_impact_events(self, after: datetime, limit: int = 10) -> list[CalendarEvent]:
         if after.tzinfo is None:

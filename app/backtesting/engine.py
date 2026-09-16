@@ -28,6 +28,7 @@ from app.backtesting.results import BacktestResult, BacktestTrade, EquityPoint
 from app.config.settings import RiskSettings
 from app.features.engine import MIN_BARS_REQUIRED, InsufficientDataError, compute_features
 from app.mt5.interface import AccountInfo, SymbolSpec
+from app.news.filter import AlwaysClearNewsFilter, NewsFilter
 from app.regimes.detector import detect_regime
 from app.regimes.thresholds import RegimeThresholds
 from app.risk.guards import GuardCheckInput, RiskGuardEngine
@@ -61,6 +62,7 @@ class BacktestEngine:
         selector: StrategySelector | None = None,
         regime_thresholds: RegimeThresholds | None = None,
         scoring_weights: ScoringWeights | None = None,
+        news_filter: NewsFilter | None = None,
     ):
         self.symbol_spec = symbol_spec
         self.risk_settings = risk_settings
@@ -69,9 +71,25 @@ class BacktestEngine:
         self.selector = selector or StrategySelector()
         self.regime_thresholds = regime_thresholds
         self.scoring_weights = scoring_weights
+        # BACKTEST-ONLY DEFAULT: unlike TradeValidator's own default
+        # (UnavailableNewsFilter, which correctly fails closed for
+        # every live/paper path), a backtest has no live news-data
+        # provider and never will, so defaulting to UnavailableNewsFilter
+        # here would silently block 100% of backtest entries at the
+        # news gate regardless of strategy quality. AlwaysClearNewsFilter
+        # is wired ONLY here, is named/documented as backtest-only, and
+        # does not fabricate any historical news data -- it simply lets
+        # the news gate pass so the rest of the validation pipeline
+        # (score, risk:reward, sizing, risk guards) can be exercised.
+        # Callers that want to specifically test the news gate itself
+        # (e.g. verifying a backtest run stays flat under a simulated
+        # blackout) can still pass UnavailableNewsFilter() or
+        # BlockedNewsFilter() explicitly via this parameter.
+        self.news_filter = news_filter or AlwaysClearNewsFilter()
         self.validator = TradeValidator(
             risk_settings,
             guard_engine=RiskGuardEngine(risk_settings),
+            news_filter=self.news_filter,
             min_score_label=self.config.min_score_label,
             min_risk_reward=self.config.min_risk_reward,
         )

@@ -52,6 +52,20 @@ def index():
     return JSONResponse({"message": "Dashboard UI not found; use the JSON endpoints directly."})
 
 
+@app.get("/api/startup-safety")
+def startup_safety_endpoint():
+    """Read-only observability endpoint (see app/safety/startup_check.py
+    and AppState.startup_safety's docstring). This reports the result
+    computed once at dashboard startup -- it does not itself gate or
+    permit trading; the authoritative gate lives in
+    scripts/run_paper_trading.py, which this endpoint has no path to
+    influence."""
+    state = get_state()
+    if state.startup_safety is None:
+        return JSONResponse({"message": "Startup safety check has not been run for this process."})
+    return state.startup_safety.to_dict()
+
+
 @app.get("/api/account")
 def account_endpoint():
     state = get_state()

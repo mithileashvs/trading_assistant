@@ -23,6 +23,7 @@ from app.regimes.thresholds import RegimeThresholds
 from app.risk.guards import RiskGuardEngine
 from app.risk.kill_switch import KillSwitch
 from app.risk.validator import TradeValidator
+from app.safety.startup_check import StartupSafetyResult, run_startup_safety_check
 from app.strategies.selector import StrategySelector
 
 
@@ -39,6 +40,13 @@ class AppState:
     execution_engine: ExecutionEngine
     position_monitor: PositionMonitor
     regime_thresholds: RegimeThresholds | None = None
+    # Computed once at startup for dashboard observability (see
+    # app/safety/startup_check.py). This is READ-ONLY / informational:
+    # the dashboard never submits orders, so there is nothing here for
+    # the frontend/API to bypass -- the actual, authoritative gate is
+    # in scripts/run_paper_trading.py, which refuses to construct/run
+    # TradingLoop at all when this check fails.
+    startup_safety: StartupSafetyResult | None = None
 
 
 def build_app_state(settings: Settings | None = None) -> AppState:
@@ -62,6 +70,13 @@ def build_app_state(settings: Settings | None = None) -> AppState:
     validator = TradeValidator(settings.risk, guard_engine=RiskGuardEngine(settings.risk), news_filter=news_filter)
     execution_engine = ExecutionEngine(client, spec, settings.trading_mode)
 
+    # Observability only -- see AppState.startup_safety's docstring.
+    # A failed/blocked result here does not stop the dashboard from
+    # starting; it is surfaced via GET /api/startup-safety instead.
+    startup_safety = run_startup_safety_check(
+        settings, client=client, journal=journal, kill_switch=kill_switch, news_filter=news_filter,
+    )
+
     return AppState(
         settings=settings,
         client=client,
@@ -73,4 +88,5 @@ def build_app_state(settings: Settings | None = None) -> AppState:
         kill_switch=kill_switch,
         execution_engine=execution_engine,
         position_monitor=PositionMonitor(),
+        startup_safety=startup_safety,
     )
