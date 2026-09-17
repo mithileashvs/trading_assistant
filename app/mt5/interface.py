@@ -103,6 +103,30 @@ class Position:
     comment: str = ""
 
 
+# Standardized values for OrderResult.raw["status"] (Phase 6). OrderResult.success
+# is a plain bool and can only ever express filled-vs-not -- it has no way to
+# express "we genuinely don't know what happened" (e.g. the connection dropped
+# after a request was sent but before a confirmation came back). Rather than
+# change OrderResult's shape (which every existing caller already depends on),
+# clients that can distinguish this case set raw["status"] to one of these
+# values on top of the existing fields. success is ALWAYS False when status is
+# UNKNOWN -- nothing may ever assume success it cannot confirm (fail-closed).
+# Absence of this key (the common case for existing code, real or mock) simply
+# means "not distinguished" -- callers should keep relying on `success` as
+# before; this is purely additive.
+EXECUTION_STATUS_FILLED = "FILLED"
+EXECUTION_STATUS_REJECTED = "REJECTED"
+EXECUTION_STATUS_UNKNOWN = "UNKNOWN"
+
+# Shared "how old can a tick be and still be safe to fill/close against"
+# threshold (Phase 6), used by MockMT5Client's own order validation and by
+# ExecutionEngine's PAPER-mode simulation (app.execution.engine). Deliberately
+# NOT wired into RealMT5Client / LIVE order submission -- that would be a
+# change to real execution behavior, out of scope for the mock-only phase
+# this was introduced in.
+STALE_TICK_SECONDS = 300
+
+
 class IMT5Client(abc.ABC):
     """Everything the rest of the system is allowed to know about MT5."""
 
