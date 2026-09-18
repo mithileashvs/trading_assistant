@@ -22,6 +22,7 @@ from typing import Optional
 
 from app.config.settings import Settings, TradingMode
 from app.execution.engine import ExecutionEngine, ManagedPosition
+from app.execution.state_store import ExecutionStateStore, SqliteExecutionStateStore
 from app.journal.journal import SignalLogEntry, TradeJournal, TradeLogEntry
 from app.market_data.engine import MarketDataEngine, StaleMarketDataError
 from app.mt5.interface import IMT5Client, SymbolSpec
@@ -75,6 +76,7 @@ class TradingLoop:
         position_monitor: Optional[PositionMonitor] = None,
         execution_engine: Optional[ExecutionEngine] = None,
         kill_switch: Optional[KillSwitch] = None,
+        execution_state_store: Optional[ExecutionStateStore] = None,
     ):
         settings.validate_live_safety()  # fails fast for an unsafe LIVE config
 
@@ -91,8 +93,19 @@ class TradingLoop:
         # (see ExecutionEngine's _NullKillSwitch docstring for why a
         # freshly-defaulted, unrelated KillSwitch would be unsafe here).
         self.kill_switch = kill_switch or KillSwitch(default_active=False)
+        # Phase 7: a persistent, file-backed ExecutionStateStore by default
+        # here too -- same reasoning as kill_switch immediately above (a
+        # production entry point must not silently lose track of an
+        # UNKNOWN/uncertain execution, or the idempotency record of an
+        # already-FILLED one, across a restart). Only applies when this
+        # constructor builds its own default ExecutionEngine; a caller
+        # supplying execution_engine directly owns that engine's store.
+        self.execution_state_store = execution_state_store or SqliteExecutionStateStore(
+            settings.execution_state_db_path
+        )
         self.execution_engine = execution_engine or ExecutionEngine(
-            client, symbol_spec, settings.trading_mode, kill_switch=self.kill_switch
+            client, symbol_spec, settings.trading_mode, kill_switch=self.kill_switch,
+            state_store=self.execution_state_store,
         )
         self.validator = TradeValidator(
             settings.risk,

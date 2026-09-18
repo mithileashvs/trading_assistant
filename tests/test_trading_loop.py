@@ -7,6 +7,7 @@ from app.config.settings import Settings, TradingMode
 from app.journal.journal import TradeJournal
 from app.mt5.mock_client import MockMT5Client
 from app.news.filter import NewsFilter, NewsState, NewsStatus
+from app.execution.state_store import SqliteExecutionStateStore
 from app.risk.kill_switch import KillSwitch
 from app.runtime.loop import TradingLoop
 from app.signals.models import Signal, SignalDirection
@@ -34,7 +35,12 @@ def _loop(settings=None, kill_switch=None, clear_news=False):
     spec = client.get_symbol_spec("XAUUSD")
     journal = _journal()
     ks = kill_switch or KillSwitch(tempfile.mktemp(suffix=".json"))
-    loop = TradingLoop(settings, client, spec, journal, kill_switch=ks)
+    # Phase 7: TradingLoop now defaults to a persistent, file-backed
+    # execution state store (mirroring kill_switch just above) -- give each
+    # test its own tempfile so tests never share state via the default
+    # ./data/execution_state.db path (same reasoning as the kill switch).
+    state_store = SqliteExecutionStateStore(tempfile.mktemp(suffix=".db"))
+    loop = TradingLoop(settings, client, spec, journal, kill_switch=ks, execution_state_store=state_store)
     if clear_news:
         loop.news_filter = _AlwaysClear()  # property setter keeps validator/safety-gate in sync
     return loop, client, spec, journal

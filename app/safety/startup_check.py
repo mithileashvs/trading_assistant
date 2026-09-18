@@ -71,6 +71,7 @@ from typing import Any, Optional
 
 from app.config.settings import Settings, TradingMode
 from app.execution.execution_safety_gate import ExecutionSafetyGate
+from app.execution.state_store import ExecutionStateStore
 from app.features.engine import InsufficientDataError, compute_features
 from app.journal.journal import TradeJournal
 from app.market_data.engine import MarketDataEngine, StaleMarketDataError, SymbolDiscoveryError
@@ -562,6 +563,49 @@ def _check_execution_gate(execution_safety_gate) -> StartupCheck:
 
 
 # ---------------------------------------------------------------------
+# 13b. Execution recovery (Phase 7): unresolved UNKNOWN executions
+# ---------------------------------------------------------------------
+def _check_execution_recovery(execution_state_store: Optional[ExecutionStateStore]) -> StartupCheck:
+    """Surfaces any UNKNOWN/uncertain executions left over from a
+    previous run (see app.execution.state_store) so an operator never
+    silently loses track of them across a restart. Deliberately
+    WARNING severity, not CRITICAL: the order-execution layer that
+    owns this state store already fail-closes at the point of
+    resubmission for the specific client_order_id(s) involved (its
+    own duplicate check runs before any resubmission attempt reaches
+    the broker), so this check's job is to make unresolved executions
+    visible, not to halt the whole process -- which would also stop
+    position monitoring for any legitimately open positions.
+    execution_state_store is optional and defaults to None (unlike
+    safety_gate/execution_safety_gate, this has no free-constructed
+    default) so this check is NOT_REQUIRED unless the caller opts in
+    by passing one, matching the pre-Phase-7 startup check contract
+    exactly for anyone who doesn't."""
+    if execution_state_store is None:
+        return StartupCheck("execution_recovery", CheckStatus.NOT_REQUIRED, Severity.INFO,
+                             "No persistent execution state store was provided; nothing to reconcile.", {})
+    try:
+        unresolved = execution_state_store.unresolved()
+    except Exception as exc:  # noqa: BLE001 - can't read persisted state -> fail closed
+        return StartupCheck(
+            "execution_recovery", CheckStatus.FAIL, Severity.CRITICAL,
+            f"Could not read persisted execution state: {type(exc).__name__}: {exc}. Recovery cannot safely "
+            "proceed until this is resolved.", {},
+        )
+    if unresolved:
+        ids = [r.client_order_id for r in unresolved]
+        return StartupCheck(
+            "execution_recovery", CheckStatus.WARNING, Severity.WARNING,
+            f"{len(unresolved)} execution(s) from a previous run have an UNKNOWN/uncertain outcome and "
+            "require reconciliation before their client_order_id can be reused for a new order: "
+            + ", ".join(ids[:10]) + (", ..." if len(ids) > 10 else ""),
+            {"unresolved_client_order_ids": ids},
+        )
+    return StartupCheck("execution_recovery", CheckStatus.PASS, Severity.INFO,
+                         "No unresolved executions pending reconciliation.", {})
+
+
+# ---------------------------------------------------------------------
 # 14. Clock / time consistency
 # ---------------------------------------------------------------------
 def _check_clock(now: datetime, max_skew_seconds: float = 300.0) -> StartupCheck:
@@ -632,6 +676,7 @@ def _run_startup_safety_check(
     execution_safety_gate,
     require_demo_account: bool,
     now: datetime,
+    execution_state_store: Optional[ExecutionStateStore] = None,
 ) -> StartupSafetyResult:
     checks: list[StartupCheck] = []
 
@@ -652,6 +697,7 @@ def _run_startup_safety_check(
     esg = ExecutionSafetyGate() if execution_safety_gate is _UNSET else execution_safety_gate
     checks.append(_check_safety_gate(sg))
     checks.append(_check_execution_gate(esg))
+    checks.append(_check_execution_recovery(execution_state_store))
 
     checks.append(_check_clock(now))
     checks.append(_check_dependencies(settings, client))
@@ -705,6 +751,7 @@ def run_startup_safety_check(
     execution_safety_gate=_UNSET,
     require_demo_account: bool = True,
     now: Optional[datetime] = None,
+    execution_state_store: Optional[ExecutionStateStore] = None,
 ) -> StartupSafetyResult:
     """Run every startup safety check and return a fail-closed,
     deterministic StartupSafetyResult.
@@ -742,12 +789,18 @@ def run_startup_safety_check(
             explicitly pass False to reach real-money LIVE semantics.
         now: reference timestamp for the news and clock checks.
             Defaults to the current UTC time.
+        execution_state_store: existing ExecutionStateStore (Phase 7) to
+            check for unresolved UNKNOWN executions left over from a
+            previous run. Omit (default None) to skip this check
+            entirely (NOT_REQUIRED) -- matching the pre-Phase-7
+            contract for anyone who doesn't opt in.
     """
     now = now or datetime.now(timezone.utc)
     try:
         return _run_startup_safety_check(
             settings, client, journal, kill_switch, news_filter,
             safety_gate, execution_safety_gate, require_demo_account, now,
+            execution_state_store=execution_state_store,
         )
     except Exception as exc:  # noqa: BLE001 - the orchestrator itself must fail closed, never propagate
         mode_value = "UNKNOWN"
@@ -782,6 +835,7 @@ _LABELS = {
     "risk_configuration": "Risk Config",
     "safety_gate": "Safety Gate",
     "execution_gate": "Execution Gate",
+    "execution_recovery": "Execution Recovery",
     "clock": "Clock",
     "dependency_health": "Dependencies",
 }

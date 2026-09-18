@@ -15,6 +15,7 @@ import pytest
 
 from app.config.settings import RiskSettings, Settings
 from app.execution.execution_safety_gate import ExecutionSafetyGate
+from app.execution.state_store import ExecutionRecord, STATUS_UNKNOWN, SqliteExecutionStateStore
 from app.journal.journal import TradeJournal
 from app.mt5.interface import AccountInfo, IMT5Client, SymbolSpec, Tick
 from app.news.filter import AlwaysClearNewsFilter, BlockedNewsFilter, NewsFilter, NewsState, NewsStatus, UnavailableNewsFilter
@@ -711,3 +712,68 @@ def test_format_report_text_mentions_failure_reason(journal, kill_switch):
     text = format_startup_report_text(result)
     assert "TRADING BLOCKED" in text
     assert "News" in text
+
+
+# ---------------------------------------------------------------------
+# Phase 7: execution recovery check
+# ---------------------------------------------------------------------
+def test_execution_recovery_not_required_when_no_store_provided(journal, kill_switch):
+    """Pre-Phase-7 callers that don't pass execution_state_store at all
+    must see identical behavior to before -- this check simply doesn't
+    run for them."""
+    result = run_startup_safety_check(
+        _settings(), client=FakeClient(), journal=journal, kill_switch=kill_switch,
+        news_filter=AlwaysClearNewsFilter(),
+    )
+    check = _by_name(result, "execution_recovery")
+    assert check.status == CheckStatus.NOT_REQUIRED
+    assert result.overall_status == "TRADING_ALLOWED"
+
+
+def test_execution_recovery_warns_but_does_not_block_on_unresolved_unknown(journal, kill_switch, tmp_path):
+    store = SqliteExecutionStateStore(str(tmp_path / "execution_state.db"))
+    store.put(ExecutionRecord(
+        client_order_id="leftover-unknown-1", status=STATUS_UNKNOWN, ticket=None,
+        symbol="XAUUSD", direction="BUY", volume=0.1,
+    ))
+    result = run_startup_safety_check(
+        _settings(), client=FakeClient(), journal=journal, kill_switch=kill_switch,
+        news_filter=AlwaysClearNewsFilter(), execution_state_store=store,
+    )
+    check = _by_name(result, "execution_recovery")
+    assert check.status == CheckStatus.WARNING
+    assert "leftover-unknown-1" in check.message
+    # A WARNING-severity check must not, by itself, block startup -- the
+    # existing per-client_order_id block in ExecutionEngine is what
+    # actually protects against a blind resubmission; this check only
+    # surfaces it to an operator.
+    assert result.overall_status == "TRADING_ALLOWED"
+
+
+def test_execution_recovery_passes_clean_when_store_has_no_unresolved_records(journal, kill_switch, tmp_path):
+    store = SqliteExecutionStateStore(str(tmp_path / "execution_state.db"))
+    result = run_startup_safety_check(
+        _settings(), client=FakeClient(), journal=journal, kill_switch=kill_switch,
+        news_filter=AlwaysClearNewsFilter(), execution_state_store=store,
+    )
+    check = _by_name(result, "execution_recovery")
+    assert check.status == CheckStatus.PASS
+
+
+def test_execution_recovery_fails_closed_and_blocks_startup_when_state_unreadable(
+    journal, kill_switch, tmp_path, monkeypatch,
+):
+    store = SqliteExecutionStateStore(str(tmp_path / "execution_state.db"))
+
+    def boom():
+        raise RuntimeError("disk read error")
+
+    monkeypatch.setattr(store, "unresolved", boom)
+    result = run_startup_safety_check(
+        _settings(), client=FakeClient(), journal=journal, kill_switch=kill_switch,
+        news_filter=AlwaysClearNewsFilter(), execution_state_store=store,
+    )
+    check = _by_name(result, "execution_recovery")
+    assert check.status == CheckStatus.FAIL
+    assert result.overall_status == "TRADING_BLOCKED"
+    assert result.trading_allowed is False

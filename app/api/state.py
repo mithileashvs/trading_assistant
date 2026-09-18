@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from app.ai.llm_client import build_llm_client
 from app.config.settings import Settings, get_settings
 from app.execution.engine import ExecutionEngine
+from app.execution.state_store import SqliteExecutionStateStore
 from app.journal.journal import TradeJournal
 from app.market_data.engine import MarketDataEngine
 from app.mt5.factory import build_mt5_client
@@ -68,13 +69,21 @@ def build_app_state(settings: Settings | None = None) -> AppState:
         minutes_after=settings.news_blackout_minutes_after,
     )
     validator = TradeValidator(settings.risk, guard_engine=RiskGuardEngine(settings.risk), news_filter=news_filter)
-    execution_engine = ExecutionEngine(client, spec, settings.trading_mode)
+    # Phase 7: same persistent store TradingLoop uses (see app.runtime.loop),
+    # for consistency -- this dashboard is read-only and doesn't submit
+    # orders (see AppState.startup_safety's docstring above), but should
+    # still observe the real, shared execution-recovery state rather than
+    # an empty in-memory one, the same way its KillSwitch above already
+    # shares TradingLoop's default state file.
+    execution_state_store = SqliteExecutionStateStore(settings.execution_state_db_path)
+    execution_engine = ExecutionEngine(client, spec, settings.trading_mode, state_store=execution_state_store)
 
     # Observability only -- see AppState.startup_safety's docstring.
     # A failed/blocked result here does not stop the dashboard from
     # starting; it is surfaced via GET /api/startup-safety instead.
     startup_safety = run_startup_safety_check(
         settings, client=client, journal=journal, kill_switch=kill_switch, news_filter=news_filter,
+        execution_state_store=execution_state_store,
     )
 
     return AppState(

@@ -72,7 +72,17 @@ class OrderRequest:
     take_profit: Optional[float] = None
     comment: str = ""
     magic: int = 0
-    client_order_id: Optional[str] = None  # for duplicate-order protection
+    client_order_id: Optional[str] = None  # optional broker/mock-level duplicate tag (see note below)
+    # Note (Phase 7): ExecutionEngine's own client_order_id bookkeeping
+    # (app.execution.state_store) is the authoritative duplicate-order
+    # safeguard and does NOT rely on this field -- ExecutionEngine
+    # deliberately does not set it on the LIVE OrderRequest it builds,
+    # since real MT5 has no such field at all (RealMT5Client never
+    # reads it) and MockMT5Client's own use of it is a permanent,
+    # never-reconciled tag that would otherwise conflict with Phase 7's
+    # "same client_order_id may be reused once explicitly resolved as
+    # NOT_FOUND" behavior. Only present for callers (tests, direct
+    # MockMT5Client use) that want that mock-level check on its own.
 
 
 @dataclass

@@ -27,7 +27,9 @@ per call or per some persistent condition, via the methods in the
 "-- fault injection (Phase 6) --" section below:
 
   - queue_connection_lost(applies_to): the NEXT call to that method
-    ("submit_order" | "get_account_info" | "get_tick") raises the
+    ("submit_order" | "get_account_info" | "get_tick" | "close_position"
+    | "close_position_partial" | "modify_position" -- the last three
+    added in Phase 7 to test close/modify recovery) raises the
     existing app.mt5.real_client.MT5ConnectionError (reused, not
     reinvented) instead of doing anything — simulates a connection
     that dropped BEFORE the call could reach the broker. Safe to
@@ -120,10 +122,14 @@ _TF_MINUTES = {
 class _Fault:
     """A one-shot fault, consumed the first time the matching method is
     called (see MockMT5Client._pop_fault)."""
-    applies_to: str  # "submit_order" | "get_account_info" | "get_tick"
+    applies_to: str  # "submit_order" | "get_account_info" | "get_tick" |
+                      # "close_position" | "close_position_partial" | "modify_position" (Phase 7)
     kind: str  # "connection_lost" | "unknown_result" | "rejected"
     retcode: Optional[int] = None
     comment: str = ""
+    # Phase 7: only meaningful for kind == "unknown_result". See
+    # queue_unknown_execution_result().
+    broker_filled: bool = False
 
 
 class MockMT5Client(IMT5Client):
@@ -173,19 +179,39 @@ class MockMT5Client(IMT5Client):
         """The NEXT call to `applies_to` raises MT5ConnectionError,
         simulating a connection that dropped BEFORE that call could do
         anything at the broker. `applies_to` must be one of
-        "submit_order", "get_account_info", "get_tick"."""
-        if applies_to not in ("submit_order", "get_account_info", "get_tick"):
+        "submit_order", "get_account_info", "get_tick", "close_position",
+        "close_position_partial", "modify_position" (the last three
+        added in Phase 7 to test close/modify recovery)."""
+        if applies_to not in (
+            "submit_order", "get_account_info", "get_tick",
+            "close_position", "close_position_partial", "modify_position",
+        ):
             raise ValueError(f"Unsupported applies_to={applies_to!r}")
         self._pending_faults.append(_Fault(applies_to, "connection_lost"))
 
-    def queue_unknown_execution_result(self) -> None:
+    def queue_unknown_execution_result(self, broker_filled: bool = False) -> None:
         """The NEXT submit_order() call simulates a connection that
         dropped AFTER the order was sent but BEFORE a confirmation came
         back -- broker acceptance is genuinely undetermined. Returns
         (does not raise) an OrderResult with success=False and
-        raw["status"] == EXECUTION_STATUS_UNKNOWN; no position is
-        created, since we cannot know one exists."""
-        self._pending_faults.append(_Fault("submit_order", "unknown_result"))
+        raw["status"] == EXECUTION_STATUS_UNKNOWN.
+
+        broker_filled=False (default, Phase 6 behavior): no position is
+        created, since we cannot know one exists -- models "the order
+        never actually reached the broker".
+
+        broker_filled=True (Phase 7): models the OTHER real-world half
+        of this same fault -- the broker actually accepted and filled
+        the order, but the CONFIRMATION back to the caller was what got
+        lost. A real position is created on this mock's broker-side
+        state (tagged with the same request.comment the caller sent),
+        even though the caller still receives UNKNOWN, exactly so
+        ExecutionEngine.reconcile_unknown() has something deterministic
+        to find. Whichever variant is used, the caller-visible result is
+        identical (UNKNOWN) -- only the broker's ground truth differs,
+        which is the whole point: from the caller's side, the two are
+        indistinguishable without reconciliation."""
+        self._pending_faults.append(_Fault("submit_order", "unknown_result", broker_filled=broker_filled))
 
     def queue_order_rejection(self, comment: str, retcode: Optional[int] = None) -> None:
         """The NEXT submit_order() call is cleanly rejected with the
@@ -482,6 +508,36 @@ class MockMT5Client(IMT5Client):
                 # good reason to exist.
                 if request.client_order_id:
                     self._client_order_ids.add(request.client_order_id)
+                # Phase 7: optionally simulate that the broker actually
+                # filled the order despite the lost confirmation -- see
+                # queue_unknown_execution_result()'s docstring. Best-effort:
+                # if no usable tick is available, the broker-side fill is
+                # simply skipped rather than raising, since that's just as
+                # valid a ground truth for testing the "genuinely never
+                # happened" reconciliation branch.
+                if fault.broker_filled:
+                    try:
+                        tick = self.get_tick(request.symbol)
+                        if tick.ask > tick.bid > 0:
+                            fill_price = tick.ask if request.direction == "BUY" else tick.bid
+                            fill_price = self._apply_slippage(fill_price, request.direction)
+                            ticket = next(self._ticket_counter)
+                            self._positions[ticket] = Position(
+                                ticket=ticket,
+                                symbol=request.symbol,
+                                direction=request.direction,
+                                volume=request.volume,
+                                price_open=fill_price,
+                                price_current=fill_price,
+                                stop_loss=request.stop_loss,
+                                take_profit=request.take_profit,
+                                profit=0.0,
+                                open_time=datetime.now(timezone.utc),
+                                magic=request.magic,
+                                comment=request.comment,
+                            )
+                    except Exception:  # noqa: BLE001 - best-effort broker-side simulation only
+                        pass
                 return OrderResult(
                     success=False, order_id=None, deal_id=None, price=None, volume=None, retcode=None,
                     comment="UNKNOWN_EXECUTION_RESULT: connection lost after the order was sent; "
@@ -592,6 +648,9 @@ class MockMT5Client(IMT5Client):
         # matters: a failure fetching the tick must never cause the
         # position to vanish from tracking while its close was never
         # actually confirmed.
+        fault = self._pop_fault("close_position")
+        if fault is not None and fault.kind == "connection_lost":
+            raise MT5ConnectionError("Mock broker: connection lost while closing the position.")
         pos = self._positions.get(ticket)
         if pos is None:
             return OrderResult(
@@ -627,6 +686,9 @@ class MockMT5Client(IMT5Client):
         )
 
     def close_position_partial(self, ticket: int, volume: float) -> OrderResult:
+        fault = self._pop_fault("close_position_partial")
+        if fault is not None and fault.kind == "connection_lost":
+            raise MT5ConnectionError("Mock broker: connection lost while partially closing the position.")
         pos = self._positions.get(ticket)
         if pos is None:
             return OrderResult(
@@ -658,6 +720,9 @@ class MockMT5Client(IMT5Client):
     def modify_position(
         self, ticket: int, stop_loss: Optional[float], take_profit: Optional[float]
     ) -> OrderResult:
+        fault = self._pop_fault("modify_position")
+        if fault is not None and fault.kind == "connection_lost":
+            raise MT5ConnectionError("Mock broker: connection lost while modifying the position.")
         pos = self._positions.get(ticket)
         if pos is None:
             return OrderResult(

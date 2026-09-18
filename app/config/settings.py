@@ -137,6 +137,18 @@ class Settings(BaseSettings):
         "sqlite:///./data/trading_journal.db", alias="DATABASE_URL"
     )
 
+    # --- Execution state / recovery (Phase 7) -------------------------------
+    execution_state_db_path: str = Field(
+        "./data/execution_state.db",
+        alias="EXECUTION_STATE_DB_PATH",
+        description=(
+            "Path to the sqlite file ExecutionEngine uses to persist "
+            "client_order_id outcomes (see app.execution.state_store), so an "
+            "UNKNOWN/uncertain execution -- or the idempotency record of an "
+            "already-FILLED order -- is never forgotten across a restart."
+        ),
+    )
+
     # --- Logging -------------------------------------------------------------
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     log_dir: str = Field("./data/logs", alias="LOG_DIR")
