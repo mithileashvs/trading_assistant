@@ -18,6 +18,7 @@ import pandas as pd
 from app.backtesting.engine import BacktestEngine
 from app.backtesting.metrics import compute_metrics
 from app.backtesting.results import BacktestResult
+from app.strategy_lab.models import OverfittingReport
 
 
 @dataclass
@@ -95,3 +96,53 @@ def walk_forward_folds(
             )
         )
     return folds
+
+
+def compute_overfitting_analysis(is_split: SplitResult, oos_split: SplitResult) -> OverfittingReport:
+    """Compute descriptive overfitting degradation between In-Sample and Out-of-Sample splits.
+
+    Provides purely descriptive statistics (never subjective ranking or recommendation).
+    """
+    is_metrics = is_split.metrics or {}
+    oos_metrics = oos_split.metrics or {}
+
+    is_net_profit = float(is_metrics.get("net_profit", 0.0))
+    oos_net_profit = float(oos_metrics.get("net_profit", 0.0))
+
+    is_trades = int(is_metrics.get("total_trades", is_metrics.get("number_of_trades", 0)))
+    oos_trades = int(oos_metrics.get("total_trades", oos_metrics.get("number_of_trades", 0)))
+
+    is_win_rate = float(is_metrics.get("win_rate", 0.0))
+    oos_win_rate = float(oos_metrics.get("win_rate", 0.0))
+
+    is_dd = float(is_metrics.get("max_drawdown_pct", 0.0))
+    oos_dd = float(oos_metrics.get("max_drawdown_pct", 0.0))
+
+    if is_net_profit != 0:
+        profit_deg = ((is_net_profit - oos_net_profit) / abs(is_net_profit)) * 100.0
+    else:
+        profit_deg = 0.0 if oos_net_profit == 0 else None
+
+    return OverfittingReport(
+        is_net_profit=is_net_profit,
+        oos_net_profit=oos_net_profit,
+        is_trades=is_trades,
+        oos_trades=oos_trades,
+        is_win_rate=is_win_rate,
+        oos_win_rate=oos_win_rate,
+        is_max_drawdown=is_dd,
+        oos_max_drawdown=oos_dd,
+        profit_degradation_pct=round(profit_deg, 4) if profit_deg is not None else None,
+        is_period={
+            "start": str(is_split.start) if is_split.start is not None else "",
+            "end": str(is_split.end) if is_split.end is not None else "",
+            "bars": is_split.bars,
+        },
+        oos_period={
+            "start": str(oos_split.start) if oos_split.start is not None else "",
+            "end": str(oos_split.end) if oos_split.end is not None else "",
+            "bars": oos_split.bars,
+        },
+        in_sample_metrics=is_metrics,
+        out_of_sample_metrics=oos_metrics,
+    )

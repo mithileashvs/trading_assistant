@@ -18,10 +18,10 @@ from app.backtesting.metrics import compute_metrics
 from app.backtesting.results import BacktestResult
 from app.config.settings import RiskSettings
 from app.mt5.interface import SymbolSpec
-from app.strategies.breakout import BreakoutStrategy
-from app.strategies.mean_reversion import MeanReversionStrategy
+from app.strategies.breakout import BreakoutConfig, BreakoutStrategy
+from app.strategies.mean_reversion import MeanReversionConfig, MeanReversionStrategy
 from app.strategies.selector import StrategySelector
-from app.strategies.trend_pullback import TrendPullbackStrategy
+from app.strategies.trend_pullback import TrendPullbackConfig, TrendPullbackStrategy
 
 ALL_STRATEGY_NAMES = ("TREND_PULLBACK", "BREAKOUT", "MEAN_REVERSION")
 
@@ -39,11 +39,18 @@ def compare_strategies(
     m15_df: pd.DataFrame,
     strategy_names: tuple[str, ...] = ALL_STRATEGY_NAMES,
     config: BacktestConfig | None = None,
+    strategy_params: dict[str, dict] | None = None,
 ) -> dict[str, StrategyComparisonEntry]:
+    strategy_params = strategy_params or {}
+
+    tp_params = strategy_params.get("TREND_PULLBACK", {})
+    brk_params = strategy_params.get("BREAKOUT", {})
+    mr_params = strategy_params.get("MEAN_REVERSION", {})
+
     strategies = {
-        "TREND_PULLBACK": TrendPullbackStrategy(),
-        "BREAKOUT": BreakoutStrategy(),
-        "MEAN_REVERSION": MeanReversionStrategy(),
+        "TREND_PULLBACK": TrendPullbackStrategy(TrendPullbackConfig(**tp_params) if tp_params else None),
+        "BREAKOUT": BreakoutStrategy(BreakoutConfig(**brk_params) if brk_params else None),
+        "MEAN_REVERSION": MeanReversionStrategy(MeanReversionConfig(**mr_params) if mr_params else None),
     }
 
     entries: dict[str, StrategyComparisonEntry] = {}

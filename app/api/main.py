@@ -12,18 +12,24 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 from app.ai.explain import explain_trade
 from app.ai.query import net_pnl_by_strategy, win_rate_for_strategy
 from app.api.performance import compute_live_performance
 from app.api.state import AppState, build_app_state
+from app.config.settings import TradingMode
 from app.features.engine import InsufficientDataError, compute_features
 from app.market_data.engine import StaleMarketDataError
 from app.risk.guards import GuardCheckInput
 from app.strategies.context import build_context
+from app.strategy_lab.models import ExperimentConfig
+from app.strategy_lab.runner import StrategyLabRunner
+from app.strategy_lab.store import SqliteResearchStore
 
 _state: AppState | None = None
 
@@ -255,3 +261,150 @@ def deactivate_kill_switch(deactivated_by: str = "dashboard_user"):
     state = get_state()
     result = state.kill_switch.deactivate(deactivated_by=deactivated_by)
     return result.__dict__
+
+
+# =====================================================================
+# Phase 11: Strategy Lab / Research Endpoints (Simulation-Only)
+# =====================================================================
+
+class RunExperimentPayload(BaseModel):
+    strategy_name: str
+    strategy_version: str = "1.0.0"
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    timeframe: str = "M15"
+    bars: int = Field(500, ge=50, le=10000)
+    regime_thresholds: Optional[dict[str, Any]] = None
+    scoring_weights: Optional[dict[str, Any]] = None
+    risk_settings: Optional[dict[str, Any]] = None
+    execution_costs: Optional[dict[str, Any]] = None
+    backtest_config: Optional[dict[str, Any]] = None
+    random_seed: Optional[int] = None
+
+
+class CompareStrategiesPayload(BaseModel):
+    bars: int = Field(500, ge=50, le=10000)
+    strategy_params: Optional[dict[str, dict[str, Any]]] = None
+
+
+class WalkForwardPayload(BaseModel):
+    strategy_name: str
+    strategy_version: str = "1.0.0"
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    timeframe: str = "M15"
+    bars: int = Field(500, ge=100, le=10000)
+    n_folds: int = Field(3, ge=2, le=10)
+    random_seed: Optional[int] = None
+
+
+@app.get("/api/research/experiments")
+def list_experiments_endpoint(strategy_name: Optional[str] = None, limit: int = 50):
+    state = get_state()
+    store = state.research_store or SqliteResearchStore(state.settings.database_url.replace("sqlite:///", ""))
+    experiments = store.list_experiments(strategy_name=strategy_name, limit=limit)
+    return {"experiments": [e.to_dict() for e in experiments]}
+
+
+@app.get("/api/research/experiments/{experiment_id}")
+def get_experiment_endpoint(experiment_id: str):
+    state = get_state()
+    store = state.research_store or SqliteResearchStore(state.settings.database_url.replace("sqlite:///", ""))
+    experiment = store.get_experiment(experiment_id)
+    if not experiment:
+        raise HTTPException(status_code=404, detail=f"Experiment '{experiment_id}' not found.")
+    return experiment.to_dict()
+
+
+@app.post("/api/research/experiments/run")
+def run_experiment_endpoint(payload: RunExperimentPayload):
+    state = get_state()
+    if state.settings.trading_mode == TradingMode.LIVE:
+        raise HTTPException(status_code=400, detail="Safety violation: Strategy research cannot run in LIVE mode.")
+
+    store = state.research_store or SqliteResearchStore(state.settings.database_url.replace("sqlite:///", ""))
+    runner = StrategyLabRunner(
+        symbol_spec=state.symbol_spec,
+        risk_settings=state.settings.risk,
+        store=store,
+        trading_mode=TradingMode.BACKTEST,
+    )
+
+    m15_df = state.client.get_ohlcv(state.symbol_spec.name, payload.timeframe, payload.bars)
+
+    config = ExperimentConfig(
+        strategy_name=payload.strategy_name,
+        strategy_version=payload.strategy_version,
+        parameters=payload.parameters,
+        timeframe=payload.timeframe,
+        regime_thresholds=payload.regime_thresholds,
+        scoring_weights=payload.scoring_weights,
+        risk_settings=payload.risk_settings,
+        execution_costs=payload.execution_costs,
+        backtest_config=payload.backtest_config,
+        random_seed=payload.random_seed,
+    )
+
+    result = runner.run_experiment(config, m15_df)
+    return result.to_dict()
+
+
+@app.post("/api/research/compare")
+def compare_strategies_endpoint(payload: CompareStrategiesPayload):
+    state = get_state()
+    if state.settings.trading_mode == TradingMode.LIVE:
+        raise HTTPException(status_code=400, detail="Safety violation: Strategy research cannot run in LIVE mode.")
+
+    store = state.research_store or SqliteResearchStore(state.settings.database_url.replace("sqlite:///", ""))
+    runner = StrategyLabRunner(
+        symbol_spec=state.symbol_spec,
+        risk_settings=state.settings.risk,
+        store=store,
+        trading_mode=TradingMode.BACKTEST,
+    )
+
+    m15_df = state.client.get_ohlcv(state.symbol_spec.name, "M15", payload.bars)
+    entries = runner.compare_strategies(m15_df, strategy_params=payload.strategy_params)
+    return {
+        name: {
+            "strategy_name": entry.strategy_name,
+            "metrics": entry.metrics,
+            "reproducibility_hash": entry.result.reproducibility_hash,
+            "trades_count": len(entry.result.trades),
+        }
+        for name, entry in entries.items()
+    }
+
+
+@app.post("/api/research/walk-forward")
+def walk_forward_endpoint(payload: WalkForwardPayload):
+    state = get_state()
+    if state.settings.trading_mode == TradingMode.LIVE:
+        raise HTTPException(status_code=400, detail="Safety violation: Strategy research cannot run in LIVE mode.")
+
+    runner = StrategyLabRunner(
+        symbol_spec=state.symbol_spec,
+        risk_settings=state.settings.risk,
+        trading_mode=TradingMode.BACKTEST,
+    )
+
+    m15_df = state.client.get_ohlcv(state.symbol_spec.name, payload.timeframe, payload.bars)
+    config = ExperimentConfig(
+        strategy_name=payload.strategy_name,
+        strategy_version=payload.strategy_version,
+        parameters=payload.parameters,
+        timeframe=payload.timeframe,
+        random_seed=payload.random_seed,
+    )
+
+    folds = runner.run_walk_forward(config, m15_df, n_folds=payload.n_folds)
+    return {
+        "folds": [
+            {
+                "label": f.label,
+                "start": str(f.start) if f.start else "",
+                "end": str(f.end) if f.end else "",
+                "bars": f.bars,
+                "metrics": f.metrics,
+            }
+            for f in folds
+        ]
+    }
