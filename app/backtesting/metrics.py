@@ -73,6 +73,17 @@ def _max_consecutive_losses(pnls: list[float]) -> int:
     return longest
 
 
+def _max_consecutive_wins(pnls: list[float]) -> int:
+    longest = current = 0
+    for pnl in pnls:
+        if pnl > 0:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
 def _sharpe_sortino(daily_returns: pd.Series, periods_per_year: int = 252) -> tuple[float, float]:
     if daily_returns.empty or daily_returns.std(ddof=0) == 0:
         return 0.0, 0.0
@@ -94,9 +105,28 @@ def compute_metrics(result: BacktestResult) -> dict:
     if n == 0:
         return {
             "number_of_trades": 0,
+            "total_trades": 0,
+            "winning_trades": 0,
+            "losing_trades": 0,
             "net_profit": result.net_profit,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
             "starting_balance": result.starting_balance,
             "ending_balance": result.ending_balance,
+            "win_rate": 0.0,
+            "loss_rate": 0.0,
+            "profit_factor": 0.0,
+            "expectancy": 0.0,
+            "average_trade": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "max_consecutive_wins": 0,
+            "max_consecutive_losses": 0,
+            "total_commissions": 0.0,
+            "total_commission": 0.0,
+            "total_spread_cost": 0.0,
+            "total_slippage_cost": 0.0,
+            "total_swap_cost": 0.0,
             "note": "No trades were taken during this backtest window.",
         }
 
@@ -113,7 +143,15 @@ def compute_metrics(result: BacktestResult) -> dict:
     avg_loss = float(losses["pnl"].mean()) if len(losses) else 0.0
 
     max_dd_abs, max_dd_pct, max_dd_duration = _max_drawdown(equity)
-    max_consecutive_losses = _max_consecutive_losses(trades_df["pnl"].tolist())
+    pnl_list = trades_df["pnl"].tolist()
+    max_consecutive_losses = _max_consecutive_losses(pnl_list)
+    max_consecutive_wins = _max_consecutive_wins(pnl_list)
+
+    # Cost aggregations
+    tot_commission = float(trades_df["commission"].sum()) if "commission" in trades_df else 0.0
+    tot_swap = float(trades_df["swap"].sum()) if "swap" in trades_df else 0.0
+    tot_spread = float(trades_df["spread_cost"].sum()) if "spread_cost" in trades_df else 0.0
+    tot_slippage = float(trades_df["slippage_cost"].sum()) if "slippage_cost" in trades_df else 0.0
 
     # Daily returns from the equity curve, for Sharpe/Sortino/Calmar.
     daily_equity = equity.resample("D").last().ffill()
@@ -140,6 +178,11 @@ def compute_metrics(result: BacktestResult) -> dict:
 
     metrics = {
         "number_of_trades": n,
+        "total_trades": n,
+        "winning_trades": len(wins),
+        "losing_trades": len(losses),
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
         "net_profit": result.net_profit,
         "starting_balance": result.starting_balance,
         "ending_balance": result.ending_balance,
@@ -157,7 +200,13 @@ def compute_metrics(result: BacktestResult) -> dict:
         "max_drawdown_abs": max_dd_abs,
         "max_drawdown_pct": max_dd_pct,
         "max_drawdown_duration_days": max_dd_duration.total_seconds() / 86400,
+        "max_consecutive_wins": max_consecutive_wins,
         "max_consecutive_losses": max_consecutive_losses,
+        "total_commission": tot_commission,
+        "total_commissions": tot_commission,
+        "total_spread_cost": tot_spread,
+        "total_slippage_cost": tot_slippage,
+        "total_swap_cost": tot_swap,
         "turnover": turnover,
         "exposure": exposure,
         "avg_mae": float(trades_df["mae"].mean()),
