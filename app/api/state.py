@@ -20,6 +20,7 @@ from app.mt5.factory import build_mt5_client
 from app.mt5.interface import IMT5Client, SymbolSpec
 from app.news.calendar import build_news_filter
 from app.positions.monitor import PositionMonitor
+from app.positions.state_store import SqlitePositionMonitorStateStore
 from app.regimes.thresholds import RegimeThresholds
 from app.risk.guards import RiskGuardEngine
 from app.risk.kill_switch import KillSwitch
@@ -77,6 +78,12 @@ def build_app_state(settings: Settings | None = None) -> AppState:
     # shares TradingLoop's default state file.
     execution_state_store = SqliteExecutionStateStore(settings.execution_state_db_path)
     execution_engine = ExecutionEngine(client, spec, settings.trading_mode, state_store=execution_state_store)
+    # Phase 8: same reasoning as execution_state_store immediately above
+    # -- observe the real, shared position-monitor state (breakeven/
+    # partial-exit/trailing idempotency, any unresolved UNKNOWN action)
+    # rather than an empty in-memory one.
+    position_monitor_state_store = SqlitePositionMonitorStateStore(settings.position_monitor_state_db_path)
+    position_monitor = PositionMonitor(state_store=position_monitor_state_store)
 
     # Observability only -- see AppState.startup_safety's docstring.
     # A failed/blocked result here does not stop the dashboard from
@@ -96,6 +103,6 @@ def build_app_state(settings: Settings | None = None) -> AppState:
         journal=journal,
         kill_switch=kill_switch,
         execution_engine=execution_engine,
-        position_monitor=PositionMonitor(),
+        position_monitor=position_monitor,
         startup_safety=startup_safety,
     )

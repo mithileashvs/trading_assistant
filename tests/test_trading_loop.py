@@ -8,6 +8,7 @@ from app.journal.journal import TradeJournal
 from app.mt5.mock_client import MockMT5Client
 from app.news.filter import NewsFilter, NewsState, NewsStatus
 from app.execution.state_store import SqliteExecutionStateStore
+from app.positions.state_store import SqlitePositionMonitorStateStore
 from app.risk.kill_switch import KillSwitch
 from app.runtime.loop import TradingLoop
 from app.signals.models import Signal, SignalDirection
@@ -40,7 +41,14 @@ def _loop(settings=None, kill_switch=None, clear_news=False):
     # test its own tempfile so tests never share state via the default
     # ./data/execution_state.db path (same reasoning as the kill switch).
     state_store = SqliteExecutionStateStore(tempfile.mktemp(suffix=".db"))
-    loop = TradingLoop(settings, client, spec, journal, kill_switch=ks, execution_state_store=state_store)
+    # Phase 8: same reasoning as execution_state_store immediately
+    # above -- give each test its own tempfile-backed position-monitor
+    # state store rather than sharing the default ./data path.
+    position_monitor_state_store = SqlitePositionMonitorStateStore(tempfile.mktemp(suffix=".db"))
+    loop = TradingLoop(
+        settings, client, spec, journal, kill_switch=ks, execution_state_store=state_store,
+        position_monitor_state_store=position_monitor_state_store,
+    )
     if clear_news:
         loop.news_filter = _AlwaysClear()  # property setter keeps validator/safety-gate in sync
     return loop, client, spec, journal

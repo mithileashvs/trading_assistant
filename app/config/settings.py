@@ -149,6 +149,18 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Position monitor state / recovery (Phase 8) -------------------------
+    position_monitor_state_db_path: str = Field(
+        "./data/position_monitor_state.db",
+        alias="POSITION_MONITOR_STATE_DB_PATH",
+        description=(
+            "Path to the sqlite file PositionMonitor uses to persist per-ticket "
+            "management state (see app.positions.state_store) -- breakeven/"
+            "partial-exit idempotency and any unresolved UNKNOWN modify/close "
+            "outcome -- so it is never forgotten across a restart."
+        ),
+    )
+
     # --- Logging -------------------------------------------------------------
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     log_dir: str = Field("./data/logs", alias="LOG_DIR")

@@ -57,10 +57,14 @@ order for the same logical trade.
 from __future__ import annotations
 
 import itertools
+import uuid
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from app.journal.journal import TradeJournal
 
 from app.backtesting.costs import ExecutionCosts, apply_entry_costs, apply_exit_costs, commission_cost
 from app.config.settings import TradingMode
@@ -135,12 +139,14 @@ class ExecutionEngine:
         costs: ExecutionCosts | None = None,
         kill_switch=None,
         state_store: Optional[ExecutionStateStore] = None,
+        journal: Optional[TradeJournal] = None,
     ):
         self.client = client
         self.symbol_spec = symbol_spec
         self.mode = mode
         self.costs = costs or ExecutionCosts()
         self.kill_switch = kill_switch or _NullKillSwitch()
+        self.journal = journal
         self._exec_safety_gate = ExecutionSafetyGate()
         # client_order_id -> outcome, persisted via an ExecutionStateStore
         # (Phase 7) -- see module docstring for why the default is
@@ -148,6 +154,51 @@ class ExecutionEngine:
         self._state_store = state_store or InMemoryExecutionStateStore()
         self._paper_positions: dict[int, ManagedPosition] = {}
         self._paper_ticket_counter = itertools.count(start=900_000_000)
+
+    def _audit(
+        self,
+        event_type: str,
+        category: str,
+        result_status: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+        ticket: Optional[int] = None,
+        side: Optional[str] = None,
+        volume: Optional[float] = None,
+        price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        strategy: Optional[str] = None,
+        regime: Optional[str] = None,
+        reason: Optional[str] = None,
+        error: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        critical: bool = False,
+    ) -> None:
+        if self.journal is None:
+            return
+        from app.journal.journal import AuditEvent
+        now = datetime.now(timezone.utc)
+        evt = AuditEvent(
+            event_id=f"ee_{event_type.lower()}_{uuid.uuid4().hex}",
+            timestamp=now,
+            event_type=event_type,
+            category=category,
+            symbol=self.symbol_spec.name if self.symbol_spec else None,
+            ticket=ticket,
+            client_order_id=client_order_id,
+            side=side,
+            volume=volume,
+            price=price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            strategy=strategy,
+            regime=regime,
+            result_status=result_status,
+            reason=reason,
+            error=error,
+            metadata=metadata,
+        )
+        self.journal.log_audit_event(evt, critical=critical)
 
     @property
     def is_paper(self) -> bool:
@@ -165,6 +216,20 @@ class ExecutionEngine:
         monetary_risk: Optional[float] = None,
         comment: str = "",
     ) -> tuple[OrderResult, Optional[ManagedPosition]]:
+        self._audit(
+            event_type="ORDER_INTENT",
+            category="order",
+            client_order_id=client_order_id,
+            side=direction,
+            volume=volume,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            strategy=strategy,
+            regime=regime,
+            reason="Order intent received",
+            critical=False,
+        )
+
         # Duplicate-order protection (section 21, section 16): the same
         # client_order_id is never submitted twice, in either mode.
         # Kept as its own early return (distinct DUPLICATE_ORDER_REJECTED
@@ -192,6 +257,17 @@ class ExecutionEngine:
                 )
             else:
                 comment = "DUPLICATE_ORDER_REJECTED"
+            self._audit(
+                event_type="ORDER_REJECTED",
+                category="order",
+                result_status="REJECTED",
+                client_order_id=client_order_id,
+                ticket=ticket,
+                side=direction,
+                volume=volume,
+                reason=comment,
+                critical=False,
+            )
             return (
                 OrderResult(success=False, order_id=ticket, deal_id=None, price=None,
                             volume=None, retcode=-1, comment=comment),
@@ -203,6 +279,17 @@ class ExecutionEngine:
         try:
             account = self.client.get_account_info()
         except Exception as exc:  # noqa: BLE001 - can't gather fresh state -> fail closed
+            self._audit(
+                event_type="EXECUTION_SAFETY_GATE_DECISION",
+                category="risk",
+                result_status="REJECTED",
+                client_order_id=client_order_id,
+                side=direction,
+                volume=volume,
+                reason=f"could not fetch account info: {exc}",
+                error=str(exc),
+                critical=False,
+            )
             return (
                 OrderResult(success=False, order_id=None, deal_id=None, price=None, volume=None,
                             retcode=-1, comment=f"EXECUTION_SAFETY_GATE_REJECTED: could not fetch account info: {exc}"),
@@ -224,6 +311,17 @@ class ExecutionEngine:
         )
         gate_result = self._exec_safety_gate.evaluate(gate_input)
         if not gate_result.approved:
+            self._audit(
+                event_type="EXECUTION_SAFETY_GATE_DECISION",
+                category="risk",
+                result_status="REJECTED",
+                client_order_id=client_order_id,
+                side=direction,
+                volume=volume,
+                reason="; ".join(gate_result.reasons),
+                metadata={"checks": gate_result.checks, "is_error": gate_result.is_error},
+                critical=False,
+            )
             return (
                 OrderResult(
                     success=False, order_id=None, deal_id=None, price=None, volume=None, retcode=-1,
@@ -232,6 +330,32 @@ class ExecutionEngine:
                 ),
                 None,
             )
+
+        self._audit(
+            event_type="EXECUTION_SAFETY_GATE_DECISION",
+            category="risk",
+            result_status="CONFIRMED",
+            client_order_id=client_order_id,
+            side=direction,
+            volume=volume,
+            reason="Approved by ExecutionSafetyGate",
+            metadata={"checks": gate_result.checks},
+            critical=False,
+        )
+
+        self._audit(
+            event_type="ORDER_SUBMISSION",
+            category="order",
+            client_order_id=client_order_id,
+            side=direction,
+            volume=volume,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            strategy=strategy,
+            regime=regime,
+            reason=f"Submitting order in {self.mode.value} mode",
+            critical=False,
+        )
 
         if self.mode == TradingMode.LIVE:
             # Phase 7: the broker-side comment carries a deterministic
@@ -284,6 +408,17 @@ class ExecutionEngine:
                 result = self.client.submit_order(request)
             except Exception as exc:  # noqa: BLE001 - deliberate: fail closed to UNKNOWN, not success or silent failure
                 self._record_unknown(client_order_id, direction, volume)
+                self._audit(
+                    event_type="ORDER_RESULT",
+                    category="order",
+                    result_status="UNKNOWN",
+                    client_order_id=client_order_id,
+                    side=direction,
+                    volume=volume,
+                    reason=f"UNKNOWN_EXECUTION_RESULT: submit_order raised {type(exc).__name__}: {exc}",
+                    error=str(exc),
+                    critical=True,
+                )
                 return (
                     OrderResult(
                         success=False, order_id=None, deal_id=None, price=None, volume=None, retcode=None,
@@ -296,6 +431,17 @@ class ExecutionEngine:
 
             if result.raw.get("status") == EXECUTION_STATUS_UNKNOWN:
                 self._record_unknown(client_order_id, direction, volume)
+                self._audit(
+                    event_type="ORDER_RESULT",
+                    category="order",
+                    result_status="UNKNOWN",
+                    client_order_id=client_order_id,
+                    side=direction,
+                    volume=volume,
+                    reason=result.comment,
+                    metadata={"raw": result.raw},
+                    critical=True,
+                )
                 if result.success:
                     # Defense in depth: an UNKNOWN-tagged result must
                     # NEVER be reported to the caller as a success, no
@@ -319,6 +465,16 @@ class ExecutionEngine:
                 return result, None
 
             if not result.success or result.order_id is None:
+                self._audit(
+                    event_type="ORDER_RESULT",
+                    category="order",
+                    result_status="REJECTED",
+                    client_order_id=client_order_id,
+                    side=direction,
+                    volume=volume,
+                    reason=result.comment,
+                    critical=True,
+                )
                 return result, None
             self._state_store.put(ExecutionRecord(
                 client_order_id=client_order_id, status=STATUS_FILLED, ticket=result.order_id,
@@ -330,11 +486,37 @@ class ExecutionEngine:
                 stop_loss=stop_loss, take_profit=take_profit, open_time=datetime.now(timezone.utc),
                 strategy=strategy, regime=regime, monetary_risk=monetary_risk, is_paper=False,
             )
+            self._audit(
+                event_type="ORDER_RESULT",
+                category="order",
+                result_status="CONFIRMED",
+                ticket=result.order_id,
+                client_order_id=client_order_id,
+                side=direction,
+                volume=result.volume or volume,
+                price=result.price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                strategy=strategy,
+                regime=regime,
+                reason=result.comment,
+                critical=True,
+            )
             return result, position
 
         # --- PAPER (and BACKTEST, if ever routed here) mode: simulate ---------------
         tick, rejection = self._fetch_valid_tick("simulate a fill")
         if rejection is not None:
+            self._audit(
+                event_type="ORDER_RESULT",
+                category="order",
+                result_status="REJECTED",
+                client_order_id=client_order_id,
+                side=direction,
+                volume=volume,
+                reason=rejection.comment,
+                critical=True,
+            )
             return rejection, None
         raw_price = tick.ask if direction == "BUY" else tick.bid
         fill = apply_entry_costs(raw_price, direction, self.costs, self.symbol_spec.tick_size)
@@ -352,6 +534,23 @@ class ExecutionEngine:
         self._paper_positions[ticket] = position
         result = OrderResult(success=True, order_id=ticket, deal_id=ticket, price=fill.price,
                               volume=volume, retcode=10009, comment="PAPER_FILLED")
+        self._audit(
+            event_type="ORDER_RESULT",
+            category="order",
+            result_status="CONFIRMED",
+            ticket=ticket,
+            client_order_id=client_order_id,
+            side=direction,
+            volume=volume,
+            price=fill.price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            strategy=strategy,
+            regime=regime,
+            reason="PAPER_FILLED",
+            metadata={"is_paper": True},
+            critical=True,
+        )
         return result, position
 
     def _record_unknown(self, client_order_id: str, direction: str, volume: float) -> None:
@@ -435,11 +634,33 @@ class ExecutionEngine:
                     volume=record.volume, created_at=record.created_at,
                     note="auto-resolved by reconcile_unknown(): a matching open position was found at the broker.",
                 ))
+                self._audit(
+                    event_type="UNKNOWN_RESOLVED",
+                    category="recovery",
+                    result_status="CONFIRMED",
+                    ticket=match.ticket,
+                    client_order_id=record.client_order_id,
+                    side=record.direction,
+                    volume=record.volume,
+                    reason="Auto-resolved by reconcile_unknown(): a matching open position was found at the broker.",
+                    metadata={"matched_ticket": match.ticket},
+                    critical=True,
+                )
                 results.append(UnknownReconciliationResult(
                     client_order_id=record.client_order_id, outcome="RESOLVED_FILLED", ticket=match.ticket,
                     detail="A matching open position was found at the broker; treated as FILLED.",
                 ))
             else:
+                self._audit(
+                    event_type="RECONCILIATION_CHECK",
+                    category="recovery",
+                    result_status="UNKNOWN",
+                    client_order_id=record.client_order_id,
+                    side=record.direction,
+                    volume=record.volume,
+                    reason="reconcile_unknown(): No matching open position found at the broker; remains UNKNOWN.",
+                    critical=False,
+                )
                 results.append(UnknownReconciliationResult(
                     client_order_id=record.client_order_id, outcome="STILL_UNKNOWN", ticket=None,
                     detail=(
@@ -450,7 +671,15 @@ class ExecutionEngine:
                 ))
         return results
 
-    def resolve_unknown_execution(self, client_order_id: str, ticket: Optional[int], note: str) -> None:
+    def resolve_unknown_execution(
+        self,
+        client_order_id: str,
+        ticket: Optional[int] = None,
+        note: str = "",
+        resolved_status: Optional[str] = None,
+        confirmed_non_execution: bool = False,
+        **kwargs: Any,
+    ) -> None:
         """Explicit, operator-driven resolution of an UNKNOWN execution
         (Phase 7) -- the only way an unresolved record ever stops
         blocking a resubmission under the same client_order_id other
@@ -460,20 +689,134 @@ class ExecutionEngine:
         Pass the real broker ticket if the order is now confirmed
         (e.g. from the broker's own trade history) to have filled, or
         ticket=None if it's confirmed to have never reached/executed
-        at the broker. `note` should record how this was confirmed,
-        for the audit trail.
+        at the broker.
+
+        A missing ticket is NOT evidence that an UNKNOWN broker execution was
+        rejected. Rejection requires explicit evidence (e.g. broker rejection
+        log, confirmed_non_execution=True, or resolved_status='REJECTED').
+        If neither execution nor rejection is established, UNKNOWN is preserved.
+        `note` should record how this was confirmed, for the audit trail.
         """
         record = self._state_store.get(client_order_id)
         if record is None or record.status != STATUS_UNKNOWN:
             raise ValueError(
                 f"client_order_id {client_order_id!r} has no unresolved UNKNOWN execution to resolve."
             )
-        status = STATUS_RESOLVED_FILLED if ticket is not None else STATUS_RESOLVED_NOT_FOUND
-        self._state_store.put(ExecutionRecord(
-            client_order_id=client_order_id, status=status, ticket=ticket,
-            symbol=record.symbol, direction=record.direction, volume=record.volume,
-            created_at=record.created_at, note=note,
-        ))
+
+        status_arg = (
+            resolved_status
+            or kwargs.get("resolution_status")
+            or kwargs.get("outcome")
+            or kwargs.get("new_status")
+        )
+        if status_arg is not None:
+            status_upper = status_arg.upper()
+            if status_upper in ("CONFIRMED", "FILLED", "RESOLVED_FILLED"):
+                outcome_status = "CONFIRMED"
+            elif status_upper in ("REJECTED", "NOT_FOUND", "RESOLVED_NOT_FOUND"):
+                outcome_status = "REJECTED"
+            elif status_upper in ("UNKNOWN", "STILL_UNKNOWN"):
+                outcome_status = "UNKNOWN"
+            else:
+                raise ValueError(
+                    f"Invalid resolved_status {status_arg!r}; must be one of CONFIRMED, REJECTED, UNKNOWN"
+                )
+        elif confirmed_non_execution:
+            outcome_status = "REJECTED"
+        elif ticket is not None and ticket > 0:
+            outcome_status = "CONFIRMED"
+        else:
+            # ticket is None (or <= 0). Check if note contains explicit evidence that execution did not occur.
+            note_lower = note.lower()
+            inconclusive_patterns = [
+                "unknown", "unclear", "uncertain", "not sure", "cannot confirm", "unable to determine",
+                "unable to confirm", "still unknown", "inconclusive", "unconfirmed", "no evidence",
+            ]
+            rejection_patterns = [
+                "rejected", "reject", "never reached", "never executed", "not executed",
+                "insufficient margin", "cancelled", "canceled", "declined", "expired",
+                "invalid volume", "order not placed", "confirmed not found",
+            ]
+            has_rejection = any(p in note_lower for p in rejection_patterns)
+            is_inconclusive = any(p in note_lower for p in inconclusive_patterns)
+
+            if has_rejection and not is_inconclusive:
+                outcome_status = "REJECTED"
+            else:
+                # Missing ticket is NOT evidence of rejection; preserve UNKNOWN.
+                outcome_status = "UNKNOWN"
+
+        if outcome_status == "CONFIRMED":
+            self._state_store.put(ExecutionRecord(
+                client_order_id=client_order_id,
+                status=STATUS_RESOLVED_FILLED,
+                ticket=ticket,
+                symbol=record.symbol,
+                direction=record.direction,
+                volume=record.volume,
+                created_at=record.created_at,
+                note=note,
+            ))
+            self._audit(
+                event_type="UNKNOWN_RESOLVED",
+                category="recovery",
+                result_status="CONFIRMED",
+                ticket=ticket,
+                client_order_id=client_order_id,
+                side=record.direction,
+                volume=record.volume,
+                reason=note,
+                metadata={"operator_resolved": True},
+                critical=True,
+            )
+        elif outcome_status == "REJECTED":
+            self._state_store.put(ExecutionRecord(
+                client_order_id=client_order_id,
+                status=STATUS_RESOLVED_NOT_FOUND,
+                ticket=ticket,
+                symbol=record.symbol,
+                direction=record.direction,
+                volume=record.volume,
+                created_at=record.created_at,
+                note=note,
+            ))
+            self._audit(
+                event_type="UNKNOWN_RESOLVED",
+                category="recovery",
+                result_status="REJECTED",
+                ticket=ticket,
+                client_order_id=client_order_id,
+                side=record.direction,
+                volume=record.volume,
+                reason=note,
+                metadata={"operator_resolved": True, "confirmed_non_execution": True},
+                critical=True,
+            )
+        else:
+            # Preserving UNKNOWN: record remains STATUS_UNKNOWN in state store,
+            # continuing to block resubmissions under this client_order_id.
+            self._state_store.put(ExecutionRecord(
+                client_order_id=client_order_id,
+                status=STATUS_UNKNOWN,
+                ticket=record.ticket,
+                symbol=record.symbol,
+                direction=record.direction,
+                volume=record.volume,
+                created_at=record.created_at,
+                note=note or record.note,
+            ))
+            self._audit(
+                event_type="RECONCILIATION_CHECK",
+                category="recovery",
+                result_status="UNKNOWN",
+                ticket=ticket,
+                client_order_id=client_order_id,
+                side=record.direction,
+                volume=record.volume,
+                reason=note or "UNKNOWN preserved: neither execution nor rejection established.",
+                metadata={"operator_resolved": False, "preserved_unknown": True},
+                critical=False,
+            )
 
     def _fetch_valid_tick(self, purpose: str) -> tuple[Optional[Tick], Optional[OrderResult]]:
         """Fetches a tick for a PAPER-mode fill/close/partial-close and
@@ -508,7 +851,20 @@ class ExecutionEngine:
         order, there is no duplicate-order risk to guard against here:
         a failed close/modify simply leaves the position open/unchanged
         at the broker, which is the safe default, so no extra
-        client_order_id-style bookkeeping is needed."""
+        client_order_id-style bookkeeping is needed.
+
+        Phase 8: an exception here means the outcome is UNKNOWN, not a
+        confirmed REJECTED -- the connection could have dropped either
+        before or after the broker actually applied the change, and
+        there is no way to tell from here. raw["status"] is tagged
+        EXECUTION_STATUS_UNKNOWN (same convention as submit_order's own
+        UNKNOWN case, Phase 6/7) specifically so callers (the Position
+        Monitor / TradingLoop) can distinguish "definitely did not
+        happen" from "we genuinely don't know" and never collapse the
+        two. A clean, non-exceptional success=False result (e.g. the
+        client validated and rejected the request outright) is NOT
+        touched here and is NOT tagged UNKNOWN -- that is a real,
+        confirmed REJECTED."""
         try:
             return fn(*args)
         except Exception as exc:  # noqa: BLE001 - fail closed: nothing here is assumed to have succeeded
@@ -516,6 +872,7 @@ class ExecutionEngine:
                 success=False, order_id=None, deal_id=None, price=None, volume=None, retcode=-1,
                 comment=f"{action}_FAILED: {type(exc).__name__}: {exc}; outcome could not be confirmed, "
                         "nothing was assumed to have succeeded",
+                raw={"status": EXECUTION_STATUS_UNKNOWN},
             )
 
     def close_position(self, ticket: int, reason: str = "") -> OrderResult:
@@ -604,12 +961,35 @@ class ExecutionEngine:
         unresolved = sum(1 for r in records if r.status == STATUS_UNKNOWN)
         notes = []
         if unresolved:
-            notes.append(
+            note = (
                 f"{unresolved} client_order_id(s) have an UNKNOWN/uncertain outcome and need manual "
                 "reconciliation against the broker's own trade history (not just open positions)."
             )
+            notes.append(note)
+            self._audit(
+                event_type="RECONCILIATION_DISCREPANCY",
+                category="recovery",
+                reason=note,
+                critical=False,
+            )
         for ticket in known_tickets - broker_tickets:
-            notes.append(f"Ticket {ticket} was tracked internally but is no longer open at the broker.")
+            note = f"Ticket {ticket} was tracked internally but is no longer open at the broker."
+            notes.append(note)
+            self._audit(
+                event_type="RECONCILIATION_DISCREPANCY",
+                category="recovery",
+                ticket=ticket,
+                reason=note,
+                critical=False,
+            )
         for ticket in broker_tickets - known_tickets:
-            notes.append(f"Ticket {ticket} is open at the broker but was not tracked internally.")
+            note = f"Ticket {ticket} is open at the broker but was not tracked internally."
+            notes.append(note)
+            self._audit(
+                event_type="RECONCILIATION_DISCREPANCY",
+                category="recovery",
+                ticket=ticket,
+                reason=note,
+                critical=False,
+            )
         return notes
