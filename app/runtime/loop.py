@@ -248,7 +248,10 @@ class TradingLoop:
         )
 
         try:
-            account = self.client.get_account_info()
+            if hasattr(self.execution_engine, "get_account_info"):
+                account = self.execution_engine.get_account_info()
+            else:
+                account = self.client.get_account_info()
         except Exception as exc:  # noqa: BLE001
             summary.errors.append(f"Could not fetch account info: {exc}")
             return summary

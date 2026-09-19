@@ -25,6 +25,8 @@ from app.api.state import AppState, build_app_state
 from app.config.settings import TradingMode
 from app.features.engine import InsufficientDataError, compute_features
 from app.market_data.engine import StaleMarketDataError
+from app.paper.metrics import compute_paper_metrics
+from app.paper.runtime import PaperTradingRuntime
 from app.risk.guards import GuardCheckInput
 from app.strategies.context import build_context
 from app.strategy_lab.models import ExperimentConfig
@@ -407,4 +409,176 @@ def walk_forward_endpoint(payload: WalkForwardPayload):
             }
             for f in folds
         ]
+    }
+
+
+# ============================================================================
+# Phase 12 — Paper Trading Endpoints (Section 34)
+# Strictly isolated simulation runtime: rejects LIVE mode fail-closed
+# ============================================================================
+
+class PaperStartPayload(BaseModel):
+    initial_balance: float = Field(default=10_000.0, gt=0)
+    bars_to_process: int = Field(default=100, gt=0, le=10_000)
+    timeframe: str = Field(default="M15")
+    trading_mode: str = Field(default="PAPER")
+    slippage_points: float = Field(default=0.0, ge=0.0)
+    spread_multiplier: float = Field(default=1.0, ge=0.0)
+
+
+def _get_or_create_paper_runtime(state: AppState) -> PaperTradingRuntime:
+    if state.paper_runtime is not None:
+        return state.paper_runtime
+
+    from app.paper.broker import PaperExecutionAdapter
+    from app.paper.store import InMemoryPaperStateStore
+
+    adapter = PaperExecutionAdapter(
+        symbol_spec=state.symbol_spec,
+        journal=state.journal,
+        initial_balance=10_000.0,
+        trading_mode=TradingMode.PAPER,
+    )
+    runtime = PaperTradingRuntime(
+        symbol_spec=state.symbol_spec,
+        settings=state.settings,
+        risk_settings=state.settings.risk,
+        paper_broker=adapter,
+        journal=state.journal,
+        kill_switch=state.kill_switch,
+        position_monitor=state.position_monitor,
+        state_store=InMemoryPaperStateStore(),
+        trading_mode=TradingMode.PAPER,
+    )
+    state.paper_runtime = runtime
+    return runtime
+
+
+@app.get("/api/paper/status")
+def paper_status_endpoint():
+    state = get_state()
+    if state.paper_runtime is None:
+        return {
+            "active": False,
+            "session_id": None,
+            "trading_mode": "PAPER",
+            "bars_processed": 0,
+            "open_positions_count": 0,
+            "reproducibility_hash": None,
+        }
+    return {
+        "active": state.paper_runtime.is_running,
+        "session_id": state.paper_runtime.session.session_id if state.paper_runtime.session else None,
+        "trading_mode": state.paper_runtime.trading_mode.value,
+        "bars_processed": state.paper_runtime.bars_processed,
+        "open_positions_count": len(state.paper_runtime.broker.positions),
+        "reproducibility_hash": (
+            state.paper_runtime.session.config.reproducibility_hash
+            if state.paper_runtime.session
+            else None
+        ),
+    }
+
+
+@app.get("/api/paper/account")
+def paper_account_endpoint():
+    state = get_state()
+    runtime = _get_or_create_paper_runtime(state)
+    acc = runtime.broker.account
+    return {
+        "balance": acc.balance,
+        "equity": acc.equity,
+        "floating_pnl": acc.floating_pnl,
+        "realized_pnl": acc.realized_pnl,
+        "margin": acc.margin,
+        "free_margin": acc.free_margin,
+        "margin_level": acc.margin_level if acc.used_margin > 0 else 0.0,
+        "consecutive_losses": acc.consecutive_losses,
+        "daily_realized_pnl": acc.daily_realized_pnl,
+        "trading_mode": runtime.trading_mode.value,
+    }
+
+
+@app.get("/api/paper/positions")
+def paper_positions_endpoint():
+    state = get_state()
+    runtime = _get_or_create_paper_runtime(state)
+    return [pos.to_dict() for pos in runtime.broker.positions]
+
+
+@app.get("/api/paper/trades")
+def paper_trades_endpoint():
+    state = get_state()
+    runtime = _get_or_create_paper_runtime(state)
+    return [pos.to_dict() for pos in runtime.broker.closed_positions]
+
+
+@app.get("/api/paper/metrics")
+def paper_metrics_endpoint():
+    state = get_state()
+    runtime = _get_or_create_paper_runtime(state)
+    trades = runtime.broker.closed_positions
+    starting_balance = (
+        runtime.session.config.initial_balance
+        if runtime.session
+        else 10_000.0
+    )
+    return compute_paper_metrics(trades, starting_balance=starting_balance)
+
+
+@app.post("/api/paper/start")
+def paper_start_endpoint(payload: PaperStartPayload):
+    state = get_state()
+    if payload.trading_mode.upper() == "LIVE" or state.settings.trading_mode == TradingMode.LIVE:
+        raise HTTPException(
+            status_code=400,
+            detail="Safety violation: LIVE trading mode is strictly prohibited in Paper Trading runtime.",
+        )
+
+    runtime = _get_or_create_paper_runtime(state)
+    if not runtime.is_running:
+        from app.paper.session import PaperSessionConfig
+
+        cfg = PaperSessionConfig(
+            initial_balance=payload.initial_balance,
+            trading_mode=TradingMode.PAPER,
+            slippage_points=payload.slippage_points,
+            spread_multiplier=payload.spread_multiplier,
+        )
+        runtime.start_session(cfg)
+
+    try:
+        df = state.client.get_ohlcv(state.symbol_spec.name, payload.timeframe, payload.bars_to_process)
+        if df is not None and not df.empty:
+            runtime.process_chronological_bars(df)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error executing paper trading simulation: {exc}")
+
+    return {
+        "status": "success",
+        "session_id": runtime.session.session_id if runtime.session else None,
+        "bars_processed": runtime.bars_processed,
+        "open_positions": len(runtime.broker.positions),
+        "closed_positions": len(runtime.broker.closed_positions),
+        "equity": runtime.broker.account.equity,
+        "balance": runtime.broker.account.balance,
+    }
+
+
+@app.post("/api/paper/stop")
+def paper_stop_endpoint():
+    state = get_state()
+    if state.paper_runtime is None or not state.paper_runtime.is_running:
+        return {"status": "not_running", "message": "No active paper trading session to stop."}
+
+    session = state.paper_runtime.stop_session("API user stopped session")
+    trades = state.paper_runtime.broker.closed_positions
+    starting_balance = session.config.initial_balance if session else 10_000.0
+    metrics = compute_paper_metrics(trades, starting_balance=starting_balance)
+    return {
+        "status": "stopped",
+        "session_id": session.session_id if session else None,
+        "bars_processed": state.paper_runtime.bars_processed,
+        "closed_positions": len(trades),
+        "metrics": metrics,
     }

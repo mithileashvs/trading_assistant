@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.ai.llm_client import build_llm_client
-from app.config.settings import Settings, get_settings
+from app.config.settings import Settings, TradingMode, get_settings
 from app.execution.engine import ExecutionEngine
 from app.execution.state_store import SqliteExecutionStateStore
 from app.journal.journal import TradeJournal
@@ -19,6 +19,7 @@ from app.market_data.engine import MarketDataEngine
 from app.mt5.factory import build_mt5_client
 from app.mt5.interface import IMT5Client, SymbolSpec
 from app.news.calendar import build_news_filter
+from app.paper.runtime import PaperTradingRuntime
 from app.positions.monitor import PositionMonitor
 from app.positions.state_store import SqlitePositionMonitorStateStore
 from app.regimes.thresholds import RegimeThresholds
@@ -45,6 +46,7 @@ class AppState:
     regime_thresholds: RegimeThresholds | None = None
     startup_safety: StartupSafetyResult | None = None
     research_store: ResearchStore | None = None
+    paper_runtime: PaperTradingRuntime | None = None
 
 
 def build_app_state(settings: Settings | None = None) -> AppState:
@@ -91,6 +93,21 @@ def build_app_state(settings: Settings | None = None) -> AppState:
 
     research_store = SqliteResearchStore(settings.database_url.replace("sqlite:///", ""))
 
+    paper_runtime = None
+    if settings.trading_mode != TradingMode.LIVE:
+        try:
+            paper_runtime = PaperTradingRuntime(
+                symbol_spec=spec,
+                settings=settings,
+                risk_settings=settings.risk,
+                journal=journal,
+                kill_switch=kill_switch,
+                position_monitor=position_monitor,
+                trading_mode=TradingMode.PAPER,
+            )
+        except Exception:
+            paper_runtime = None
+
     return AppState(
         settings=settings,
         client=client,
@@ -104,4 +121,5 @@ def build_app_state(settings: Settings | None = None) -> AppState:
         position_monitor=position_monitor,
         startup_safety=startup_safety,
         research_store=research_store,
+        paper_runtime=paper_runtime,
     )
